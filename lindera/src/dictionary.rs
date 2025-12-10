@@ -14,7 +14,7 @@ use lindera_cc_cedict::DICTIONARY_NAME as CC_CEDICT_DICTIONARY_NAME;
 use lindera_cc_cedict::embedded::EmbeddedCcCedictLoader;
 use lindera_dictionary::loader::DictionaryLoader;
 use lindera_dictionary::loader::FSDictionaryLoader;
-use lindera_dictionary::loader::user_dictionary::UserDictionaryLoader;
+// Removed: use lindera_dictionary::loader::user_dictionary::UserDictionaryLoader;
 
 #[cfg(feature = "train")]
 pub use lindera_dictionary::trainer;
