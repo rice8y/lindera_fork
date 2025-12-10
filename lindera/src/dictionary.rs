@@ -43,6 +43,7 @@ pub type Metadata = lindera_dictionary::dictionary::metadata::Metadata;
 pub type UserDictionary = lindera_dictionary::dictionary::UserDictionary;
 pub type WordId = lindera_dictionary::viterbi::WordId;
 pub type DictionaryBuilder = lindera_dictionary::builder::DictionaryBuilder;
+pub type UserDictionaryLoader = lindera_dictionary::loader::user_dictionary::UserDictionaryLoader;
 pub type DictionaryConfig = Value;
 pub type UserDictionaryConfig = Value;
 pub type Schema = lindera_dictionary::dictionary::schema::Schema;
