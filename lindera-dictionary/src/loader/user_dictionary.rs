@@ -23,4 +23,13 @@ impl UserDictionaryLoader {
     ) -> LinderaResult<UserDictionary> {
         builder.build_user_dict(path.as_ref())
     }
+
+    /// Load user dictionary from a CSV data
+    /// Requires a DictionaryBuilder to build the user dictionary from CSV format
+    pub fn load_from_csv_data(
+        builder: DictionaryBuilder,
+        data: &[u8],
+    ) -> LinderaResult<UserDictionary> {
+        builder.build_user_dict_from_data(data)
+    }
 }

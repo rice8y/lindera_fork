@@ -15,7 +15,7 @@ use self::connection_cost_matrix::ConnectionCostMatrixBuilderOptions;
 use self::metadata::MetadataBuilder;
 use self::prefix_dictionary::PrefixDictionaryBuilderOptions;
 use self::unknown_dictionary::UnknownDictionaryBuilderOptions;
-use self::user_dictionary::{UserDictionaryBuilderOptions, build_user_dictionary};
+use self::user_dictionary::{UserDictionaryBuilderOptions, build_user_dictionary, UserDictionaryBuilder};
 use crate::LinderaResult;
 use crate::dictionary::UserDictionary;
 use crate::dictionary::character_definition::CharacterDefinition;
@@ -116,6 +116,14 @@ impl DictionaryBuilder {
     }
 
     pub fn build_user_dict(&self, input_file: &Path) -> LinderaResult<UserDictionary> {
+        self.make_user_dict_builder().build(input_file)
+    }
+
+    pub fn build_user_dict_from_data(&self, data: &[u8]) -> LinderaResult<UserDictionary> {
+        self.make_user_dict_builder().build_from_data(data)
+    }
+
+    fn make_user_dict_builder(&self) -> UserDictionaryBuilder {
         let userdic_schema = self.metadata.user_dictionary_schema.clone();
         let dict_schema = self.metadata.dictionary_schema.clone();
         let default_field_value = self.metadata.default_field_value.clone();
@@ -150,6 +158,5 @@ impl DictionaryBuilder {
             })))
             .builder()
             .unwrap()
-            .build(input_file)
     }
 }

@@ -44,10 +44,7 @@ impl UserDictionaryBuilder {
     pub fn build(&self, input_file: &Path) -> LinderaResult<UserDictionary> {
         debug!("reading {input_file:?}");
 
-        let mut rdr = csv::ReaderBuilder::new()
-            .has_headers(false)
-            .flexible(self.flexible_csv)
-            .from_path(input_file)
+        let reader = File::open(input_file)
             .map_err(|err| {
                 LinderaErrorKind::Io
                     .with_error(anyhow::anyhow!(err))
@@ -56,15 +53,29 @@ impl UserDictionaryBuilder {
                     ))
             })?;
 
+        self.build_inner(reader, &format!("{input_file:?}"))
+    }
+
+    pub fn build_from_data(&self, data: &[u8]) -> LinderaResult<UserDictionary> {
+        debug!("reading user dictionary from data");
+        self.build_inner(data, "CSV data")
+    }
+
+    fn build_inner<R: io::Read>(&self, reader: R, source_name: &str) -> LinderaResult<UserDictionary> {
+        let mut rdr = csv::ReaderBuilder::new()
+            .has_headers(false)
+            .flexible(self.flexible_csv)
+            .from_reader(reader);
+
         let mut rows: Vec<StringRecord> = vec![];
         for (line_num, result) in rdr.records().enumerate() {
             let record = result.map_err(|err| {
                 LinderaErrorKind::Content
                     .with_error(anyhow::anyhow!(err))
                     .add_context(format!(
-                        "Failed to parse CSV record at line {} in file: {:?}",
+                        "Failed to parse CSV record at line {} in file: {}",
                         line_num + 1,
-                        input_file
+                        source_name
                     ))
             })?;
             rows.push(record);
