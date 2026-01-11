@@ -44,14 +44,13 @@ impl UserDictionaryBuilder {
     pub fn build(&self, input_file: &Path) -> LinderaResult<UserDictionary> {
         debug!("reading {input_file:?}");
 
-        let reader = File::open(input_file)
-            .map_err(|err| {
-                LinderaErrorKind::Io
-                    .with_error(anyhow::anyhow!(err))
-                    .add_context(format!(
-                        "Failed to open user dictionary CSV file: {input_file:?}"
-                    ))
-            })?;
+        let reader = File::open(input_file).map_err(|err| {
+            LinderaErrorKind::Io
+                .with_error(anyhow::anyhow!(err))
+                .add_context(format!(
+                    "Failed to open user dictionary CSV file: {input_file:?}"
+                ))
+        })?;
 
         self.build_inner(reader, &format!("{input_file:?}"))
     }
@@ -61,7 +60,11 @@ impl UserDictionaryBuilder {
         self.build_inner(data, "CSV data")
     }
 
-    fn build_inner<R: io::Read>(&self, reader: R, source_name: &str) -> LinderaResult<UserDictionary> {
+    fn build_inner<R: io::Read>(
+        &self,
+        reader: R,
+        source_name: &str,
+    ) -> LinderaResult<UserDictionary> {
         let mut rdr = csv::ReaderBuilder::new()
             .has_headers(false)
             .flexible(self.flexible_csv)

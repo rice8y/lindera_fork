@@ -15,7 +15,9 @@ use self::connection_cost_matrix::ConnectionCostMatrixBuilderOptions;
 use self::metadata::MetadataBuilder;
 use self::prefix_dictionary::PrefixDictionaryBuilderOptions;
 use self::unknown_dictionary::UnknownDictionaryBuilderOptions;
-use self::user_dictionary::{UserDictionaryBuilderOptions, build_user_dictionary, UserDictionaryBuilder};
+use self::user_dictionary::{
+    UserDictionaryBuilder, UserDictionaryBuilderOptions, build_user_dictionary,
+};
 use crate::LinderaResult;
 use crate::dictionary::UserDictionary;
 use crate::dictionary::character_definition::CharacterDefinition;
