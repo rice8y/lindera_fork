@@ -118,14 +118,14 @@ impl DictionaryBuilder {
     }
 
     pub fn build_user_dict(&self, input_file: &Path) -> LinderaResult<UserDictionary> {
-        self.make_user_dict_builder().build(input_file)
+        self.make_user_dictionary_builder().build(input_file)
     }
 
     pub fn build_user_dict_from_data(&self, data: &[u8]) -> LinderaResult<UserDictionary> {
-        self.make_user_dict_builder().build_from_data(data)
+        self.make_user_dictionary_builder().build_from_data(data)
     }
 
-    fn make_user_dict_builder(&self) -> UserDictionaryBuilder {
+    fn make_user_dictionary_builder(&self) -> UserDictionaryBuilder {
         let userdic_schema = self.metadata.user_dictionary_schema.clone();
         let dict_schema = self.metadata.dictionary_schema.clone();
         let default_field_value = self.metadata.default_field_value.clone();
