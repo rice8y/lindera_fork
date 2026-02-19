@@ -93,9 +93,12 @@ impl Segmenter {
     /// use lindera::segmenter::Segmenter;
     ///
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # #[cfg(feature = "embed-ipadic")]
+    /// # {
     /// let dictionary = load_dictionary("embedded://ipadic")?;
     /// let segmenter = Segmenter::new(Mode::Normal, dictionary, None)
     ///     .keep_whitespace(true);
+    /// # }
     /// # Ok(())
     /// # }
     /// ```
@@ -237,8 +240,53 @@ impl Segmenter {
     ///
     /// - If the lattice fails to be processed or if there is an issue with the segmentation process, the function returns an error.
     pub fn segment<'a>(&'a self, text: Cow<'a, str>) -> LinderaResult<Vec<Token<'a>>> {
-        let mut tokens: Vec<Token> = Vec::new();
         let mut lattice = Lattice::default();
+        self.segment_with_lattice(text, &mut lattice)
+    }
+
+    /// Segments the input text into tokens based on the dictionary and user-defined rules.
+    ///
+    /// # Arguments
+    ///
+    /// * `text` - A `Cow<'a, str>` representing the input text. This can either be borrowed or owned, allowing for efficient text handling depending on the use case.
+    /// * `lattice` - A mutable reference to a `Lattice` structure. This allows reusing the lattice across multiple calls to avoid memory allocation.
+    ///
+    /// # Returns
+    ///
+    /// Returns a `LinderaResult<Vec<Token<'a>>>` which contains a vector of tokens segmented from the input text. Each token represents a portion of the original text, along with metadata such as byte offsets and dictionary information.
+    ///
+    /// # Process
+    ///
+    /// 1. **Sentence Splitting**:
+    ///    - The input text is split into sentences using Japanese punctuation (`。`, `、`, `\n`, `\t`). Each sentence is processed individually.
+    ///
+    /// 2. **Lattice Processing**:
+    ///    - For each sentence, a lattice structure is set up using the main dictionary and, if available, the user dictionary. The lattice helps identify possible token boundaries within the sentence.
+    ///    - The cost matrix is used to calculate the best path (i.e., the optimal sequence of tokens) through the lattice based on the mode.
+    ///
+    /// 3. **Token Generation**:
+    ///    - For each segment (determined by the lattice), a token is generated using the byte offsets. The tokens contain the original text (in `Cow::Owned` form to ensure safe return), byte start/end positions, token positions, and dictionary references.
+    ///
+    /// # Notes
+    ///
+    /// - The function ensures that each token is safely returned by converting substrings into `Cow::Owned` strings.
+    /// - Byte offsets are carefully calculated to ensure that token boundaries are correct even across multiple sentences.
+    ///
+    /// # Example Flow
+    ///
+    /// - Text is split into sentences based on punctuation.
+    /// - A lattice is created and processed for each sentence.
+    /// - Tokens are extracted from the lattice and returned in a vector.
+    ///
+    /// # Errors
+    ///
+    /// - If the lattice fails to be processed or if there is an issue with the segmentation process, the function returns an error.
+    pub fn segment_with_lattice<'a>(
+        &'a self,
+        text: Cow<'a, str>,
+        lattice: &mut Lattice,
+    ) -> LinderaResult<Vec<Token<'a>>> {
+        let mut tokens: Vec<Token> = Vec::new();
 
         let mut position = 0_usize;
         let mut byte_position = 0_usize;
@@ -279,10 +327,11 @@ impl Segmenter {
                 &self.user_dictionary.as_ref().map(|d| &d.dict),
                 &self.dictionary.character_definition,
                 &self.dictionary.unknown_dictionary,
+                &self.dictionary.connection_cost_matrix,
                 sentence,
                 &self.mode,
             );
-            lattice.calculate_path_costs(&self.dictionary.connection_cost_matrix, &self.mode);
+            // Forward Viterbi implementation handles cost calculation within `set_text`.
 
             let offsets = lattice.tokens_offset();
 
@@ -351,17 +400,163 @@ impl Segmenter {
 
         Ok(tokens)
     }
+
+    /// Segments the input text and returns the top-N segmentation results.
+    ///
+    /// Each result is a `Vec<Token>` representing one possible segmentation.
+    /// Results are ordered by cost (best first).
+    /// If `unique` is true, results with the same word boundaries but different
+    /// POS tags are deduplicated (only the lowest-cost variant is kept).
+    pub fn segment_nbest<'a>(
+        &'a self,
+        text: Cow<'a, str>,
+        n: usize,
+        unique: bool,
+        cost_threshold: Option<i64>,
+    ) -> LinderaResult<Vec<(Vec<Token<'a>>, i64)>> {
+        let mut lattice = Lattice::default();
+        self.segment_nbest_with_lattice(text, &mut lattice, n, unique, cost_threshold)
+    }
+
+    /// Segments the input text and returns the top-N segmentation results with costs.
+    /// Each result is a (tokens, cost) pair.
+    /// If `unique` is true, results with the same word boundaries but different
+    /// POS tags are deduplicated (only the lowest-cost variant is kept).
+    /// If `cost_threshold` is Some(t), paths whose cost exceeds best_cost + t
+    /// are discarded.
+    pub fn segment_nbest_with_lattice<'a>(
+        &'a self,
+        text: Cow<'a, str>,
+        lattice: &mut Lattice,
+        n: usize,
+        unique: bool,
+        cost_threshold: Option<i64>,
+    ) -> LinderaResult<Vec<(Vec<Token<'a>>, i64)>> {
+        let mut all_results: Vec<(Vec<Token>, i64)> = Vec::with_capacity(n);
+
+        let text_bytes = text.as_bytes();
+        let text_len = text.len();
+        let mut sentence_start = 0;
+
+        while sentence_start < text_len {
+            // Find the end of the current sentence
+            let mut sentence_end = sentence_start;
+            while sentence_end < text_len {
+                let ch = text_bytes[sentence_end];
+                sentence_end += 1;
+                if ch == b'\n' || ch == b'\t' {
+                    break;
+                }
+                if sentence_end >= 3 && sentence_end <= text_len {
+                    let last_3 = &text_bytes[sentence_end - 3..sentence_end];
+                    if last_3 == "。".as_bytes() || last_3 == "、".as_bytes() {
+                        break;
+                    }
+                }
+            }
+
+            let sentence = &text[sentence_start..sentence_end];
+            if sentence.is_empty() {
+                sentence_start = sentence_end;
+                continue;
+            }
+
+            // Process the sentence through N-Best lattice
+            lattice.set_text_nbest(
+                &self.dictionary.prefix_dictionary,
+                &self.user_dictionary.as_ref().map(|d| &d.dict),
+                &self.dictionary.character_definition,
+                &self.dictionary.unknown_dictionary,
+                &self.dictionary.connection_cost_matrix,
+                sentence,
+                &self.mode,
+            );
+
+            let nbest_offsets = lattice.nbest_tokens_offset(n, unique, cost_threshold);
+
+            for (rank, (offsets, cost)) in nbest_offsets.into_iter().enumerate() {
+                if rank >= all_results.len() {
+                    all_results.resize_with(rank + 1, || (Vec::new(), 0));
+                }
+
+                // Accumulate cost across sentences
+                all_results[rank].1 += cost;
+
+                let mut position = all_results[rank].0.len();
+                let mut byte_position: usize = if all_results[rank].0.is_empty() {
+                    0
+                } else {
+                    all_results[rank].0.last().map_or(0, |t| t.byte_end)
+                };
+
+                for i in 0..offsets.len() {
+                    let (byte_start, word_id) = offsets[i];
+                    let byte_end = if i == offsets.len() - 1 {
+                        sentence.len()
+                    } else {
+                        offsets[i + 1].0
+                    };
+
+                    let absolute_start = sentence_start + byte_start;
+                    let absolute_end = sentence_start + byte_end;
+
+                    // Skip whitespace tokens if keep_whitespace is false
+                    if !self.keep_whitespace
+                        && let Some(space_category_id) = self.space_category_id
+                    {
+                        let token_text = &sentence[byte_start..byte_end];
+                        let is_space = token_text.chars().all(|c| {
+                            self.dictionary
+                                .character_definition
+                                .lookup_categories(c)
+                                .contains(&space_category_id)
+                        });
+
+                        if is_space {
+                            byte_position += byte_end - byte_start;
+                            continue;
+                        }
+                    }
+
+                    let surface_cow = match &text {
+                        Cow::Borrowed(s) => Cow::Borrowed(&s[absolute_start..absolute_end]),
+                        Cow::Owned(s) => Cow::Owned(s[absolute_start..absolute_end].to_owned()),
+                    };
+
+                    let token_start = byte_position;
+                    byte_position += byte_end - byte_start;
+                    let token_end = byte_position;
+
+                    all_results[rank].0.push(Token::new(
+                        surface_cow,
+                        token_start,
+                        token_end,
+                        position,
+                        word_id,
+                        &self.dictionary,
+                        self.user_dictionary.as_ref(),
+                    ));
+
+                    position += 1;
+                }
+            }
+
+            sentence_start = sentence_end;
+        }
+
+        Ok(all_results)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     #[allow(unused_imports)]
     #[cfg(any(
-        feature = "embedded-ipadic",
-        feature = "embedded-ipadic-neologd",
-        feature = "embedded-unidic",
-        feature = "embedded-ko-dic",
-        feature = "embedded-cc-cedict"
+        feature = "embed-ipadic",
+        feature = "embed-ipadic-neologd",
+        feature = "embed-unidic",
+        feature = "embed-ko-dic",
+        feature = "embed-cc-cedict"
     ))]
     use std::{
         fs::File,
@@ -372,15 +567,15 @@ mod tests {
     // use crate::mode::{Mode, Penalty};
 
     #[cfg(any(
-        feature = "embedded-ipadic",
-        feature = "embedded-unidic",
-        feature = "embedded-ko-dic",
-        feature = "embedded-cc-cedict"
+        feature = "embed-ipadic",
+        feature = "embed-unidic",
+        feature = "embed-ko-dic",
+        feature = "embed-cc-cedict"
     ))]
     use crate::segmenter::{Segmenter, SegmenterConfig};
 
     #[test]
-    #[cfg(feature = "embedded-ipadic")]
+    #[cfg(feature = "embed-ipadic")]
     fn test_segmenter_config_ipadic_normal() {
         let config_str = r#"
         {
@@ -394,7 +589,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "embedded-ipadic")]
+    #[cfg(feature = "embed-ipadic")]
     fn test_segmenter_config_ipadic_decompose() {
         let config_str = r#"
         {
@@ -415,7 +610,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "embedded-ipadic")]
+    #[cfg(feature = "embed-ipadic")]
     fn test_segment_ipadic() {
         use std::borrow::Cow;
 
@@ -673,7 +868,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "embedded-unidic")]
+    #[cfg(feature = "embed-unidic")]
     fn test_segment_unidic() {
         use std::borrow::Cow;
 
@@ -1083,7 +1278,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "embedded-ko-dic")]
+    #[cfg(feature = "embed-ko-dic")]
     fn test_segment_ko_dic() {
         use std::borrow::Cow;
 
@@ -1253,7 +1448,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "embedded-cc-cedict")]
+    #[cfg(feature = "embed-cc-cedict")]
     fn test_segment_cc_cedict() {
         use std::borrow::Cow;
 
@@ -1382,12 +1577,16 @@ mod tests {
             assert_eq!(token.byte_end, 36);
             assert_eq!(token.position, 5);
             assert_eq!(token.position_length, 1);
-            assert_eq!(token.details(), vec!["UNK"]);
+            assert!(token.word_id.is_unknown());
+            assert_eq!(
+                token.details(),
+                vec!["*", "*", "*", "*", "*", "*", "*", "*"]
+            );
         }
     }
 
     #[test]
-    #[cfg(feature = "embedded-ipadic")]
+    #[cfg(feature = "embed-ipadic")]
     fn test_segment_with_simple_userdic_ipadic() {
         use std::borrow::Cow;
 
@@ -1536,7 +1735,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "embedded-unidic")]
+    #[cfg(feature = "embed-unidic")]
     fn test_segment_with_simple_userdic_unidic() {
         use std::borrow::Cow;
 
@@ -1801,7 +2000,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "embedded-ko-dic")]
+    #[cfg(feature = "embed-ko-dic")]
     fn test_segment_with_simple_userdic_ko_dic() {
         use std::borrow::Cow;
 
@@ -1881,7 +2080,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "embedded-cc-cedict")]
+    #[cfg(feature = "embed-cc-cedict")]
     fn test_segment_with_simple_userdic_cc_cedict() {
         use std::borrow::Cow;
 
@@ -1984,12 +2183,16 @@ mod tests {
             assert_eq!(token.byte_end, 30);
             assert_eq!(token.position, 4);
             assert_eq!(token.position_length, 1);
-            assert_eq!(token.details(), vec!["UNK"]);
+            assert!(token.word_id.is_unknown());
+            assert_eq!(
+                token.details(),
+                vec!["*", "*", "*", "*", "*", "*", "*", "*"]
+            );
         }
     }
 
     #[test]
-    #[cfg(feature = "embedded-ipadic")]
+    #[cfg(feature = "embed-ipadic")]
     fn test_segment_with_simple_userdic_bin_ipadic() {
         use std::borrow::Cow;
 
@@ -2138,7 +2341,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "embedded-unidic")]
+    #[cfg(feature = "embed-unidic")]
     fn test_segment_with_simple_userdic_bin_unidic() {
         use std::borrow::Cow;
 
@@ -2403,7 +2606,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "embedded-ko-dic")]
+    #[cfg(feature = "embed-ko-dic")]
     fn test_segment_with_simple_userdic_bin_ko_dic() {
         use std::borrow::Cow;
 
@@ -2483,7 +2686,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "embedded-cc-cedict")]
+    #[cfg(feature = "embed-cc-cedict")]
     fn test_segment_with_simple_userdic_bin_cc_cedict() {
         use std::borrow::Cow;
 
@@ -2586,12 +2789,16 @@ mod tests {
             assert_eq!(token.byte_end, 30);
             assert_eq!(token.position, 4);
             assert_eq!(token.position_length, 1);
-            assert_eq!(token.details(), vec!["UNK"]);
+            assert!(token.word_id.is_unknown());
+            assert_eq!(
+                token.details(),
+                vec!["*", "*", "*", "*", "*", "*", "*", "*"]
+            );
         }
     }
 
     #[test]
-    #[cfg(feature = "embedded-ipadic")]
+    #[cfg(feature = "embed-ipadic")]
     fn test_segment_with_detailed_userdic_ipadic() {
         use std::borrow::Cow;
 
@@ -2740,7 +2947,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "embedded-ipadic")]
+    #[cfg(feature = "embed-ipadic")]
     #[should_panic(expected = "failed to parse word cost")]
     fn test_user_dict_invalid_word_cost() {
         let userdic_file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -2758,7 +2965,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "embedded-ipadic")]
+    #[cfg(feature = "embed-ipadic")]
     #[should_panic(expected = "user dictionary should be a CSV with 3 or 13+ fields")]
     fn test_user_dict_number_of_fields_is_11() {
         let userdic_file = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -2776,7 +2983,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "embedded-ipadic")]
+    #[cfg(feature = "embed-ipadic")]
     fn test_segment_with_nomal_mode() {
         use std::borrow::Cow;
 
@@ -2841,12 +3048,16 @@ mod tests {
             assert_eq!(token.byte_end, 36);
             assert_eq!(token.position, 2);
             assert_eq!(token.position_length, 1);
-            assert_eq!(token.details(), vec!["UNK"]);
+            assert!(token.word_id.is_unknown());
+            assert_eq!(
+                token.details(),
+                vec!["名詞", "一般", "*", "*", "*", "*", "*", "*", "*"]
+            );
         }
     }
 
     #[test]
-    #[cfg(feature = "embedded-ipadic")]
+    #[cfg(feature = "embed-ipadic")]
     fn test_segment_with_decompose_mode() {
         use std::borrow::Cow;
 
@@ -2940,12 +3151,16 @@ mod tests {
             assert_eq!(token.byte_end, 36);
             assert_eq!(token.position, 3);
             assert_eq!(token.position_length, 1);
-            assert_eq!(token.details(), vec!["UNK"]);
+            assert!(token.word_id.is_unknown());
+            assert_eq!(
+                token.details(),
+                vec!["名詞", "一般", "*", "*", "*", "*", "*", "*", "*"]
+            );
         }
     }
 
     #[test]
-    #[cfg(feature = "embedded-ipadic")]
+    #[cfg(feature = "embed-ipadic")]
     fn test_segment_with_decompose_mode_default_penalty() {
         use std::borrow::Cow;
 
@@ -3033,12 +3248,16 @@ mod tests {
             assert_eq!(token.byte_end, 36);
             assert_eq!(token.position, 3);
             assert_eq!(token.position_length, 1);
-            assert_eq!(token.details(), vec!["UNK"]);
+            assert!(token.word_id.is_unknown());
+            assert_eq!(
+                token.details(),
+                vec!["名詞", "一般", "*", "*", "*", "*", "*", "*", "*"]
+            );
         }
     }
 
     #[test]
-    #[cfg(feature = "embedded-ipadic")]
+    #[cfg(feature = "embed-ipadic")]
     fn test_segment_default_ignores_space() {
         use std::borrow::Cow;
 
@@ -3060,7 +3279,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "embedded-ipadic")]
+    #[cfg(feature = "embed-ipadic")]
     fn test_segment_with_keep_whitespace() {
         use std::borrow::Cow;
 
@@ -3084,7 +3303,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "embedded-ipadic")]
+    #[cfg(feature = "embed-ipadic")]
     fn test_segment_with_builder_keep_whitespace() {
         use std::borrow::Cow;
 
@@ -3103,7 +3322,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "embedded-ipadic")]
+    #[cfg(feature = "embed-ipadic")]
     fn test_segment_default_multiple_spaces() {
         use std::borrow::Cow;
 
@@ -3125,7 +3344,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "embedded-ipadic")]
+    #[cfg(feature = "embed-ipadic")]
     fn test_segment_default_leading_trailing() {
         use std::borrow::Cow;
 
@@ -3153,7 +3372,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "embedded-ipadic")]
+    #[cfg(feature = "embed-ipadic")]
     fn test_long_text() {
         use std::borrow::Cow;
 
@@ -3179,5 +3398,131 @@ mod tests {
             .segment(Cow::Borrowed(large_text.as_str()))
             .unwrap();
         assert!(!tokens.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "embed-ipadic")]
+    fn test_segment_nbest_1best_matches_segment() {
+        use std::borrow::Cow;
+
+        let config = serde_json::json!({
+            "dictionary": "embedded://ipadic",
+            "mode": "normal"
+        });
+        let segmenter = Segmenter::from_config(&config).unwrap();
+
+        let text = "すもももももももものうち";
+
+        // 1-best result should match normal segment
+        let normal_tokens = segmenter.segment(Cow::Borrowed(text)).unwrap();
+        let nbest_results = segmenter
+            .segment_nbest(Cow::Borrowed(text), 1, false, None)
+            .unwrap();
+
+        assert_eq!(nbest_results.len(), 1);
+        let (nbest_tokens, _cost) = &nbest_results[0];
+        assert_eq!(normal_tokens.len(), nbest_tokens.len());
+        for (normal, nbest) in normal_tokens.iter().zip(nbest_tokens.iter()) {
+            assert_eq!(normal.surface.as_ref(), nbest.surface.as_ref());
+            assert_eq!(normal.byte_start, nbest.byte_start);
+            assert_eq!(normal.byte_end, nbest.byte_end);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "embed-ipadic")]
+    fn test_segment_nbest_multiple_results() {
+        use std::borrow::Cow;
+
+        let config = serde_json::json!({
+            "dictionary": "embedded://ipadic",
+            "mode": "normal"
+        });
+        let segmenter = Segmenter::from_config(&config).unwrap();
+
+        let text = "すもももももももものうち";
+        let results = segmenter
+            .segment_nbest(Cow::Borrowed(text), 3, false, None)
+            .unwrap();
+
+        // Should return at least 2 different results for this ambiguous text
+        assert!(results.len() >= 2);
+
+        // All results should cover the full text
+        for (tokens, _cost) in &results {
+            assert!(!tokens.is_empty());
+            // First token starts at 0
+            assert_eq!(tokens[0].byte_start, 0);
+            // Last token ends at the end of the text
+            let last = tokens.last().unwrap();
+            assert_eq!(last.byte_end, text.len());
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "embed-ipadic")]
+    fn test_segment_nbest_empty_input() {
+        use std::borrow::Cow;
+
+        let config = serde_json::json!({
+            "dictionary": "embedded://ipadic",
+            "mode": "normal"
+        });
+        let segmenter = Segmenter::from_config(&config).unwrap();
+
+        let results = segmenter
+            .segment_nbest(Cow::Borrowed(""), 3, false, None)
+            .unwrap();
+        assert!(results.is_empty() || results.iter().all(|(r, _)| r.is_empty()));
+    }
+
+    #[test]
+    #[cfg(feature = "embed-ipadic")]
+    fn test_segment_nbest_zero_n() {
+        use std::borrow::Cow;
+
+        let config = serde_json::json!({
+            "dictionary": "embedded://ipadic",
+            "mode": "normal"
+        });
+        let segmenter = Segmenter::from_config(&config).unwrap();
+
+        let results = segmenter
+            .segment_nbest(Cow::Borrowed("テスト"), 0, false, None)
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    #[cfg(feature = "embed-ipadic")]
+    fn test_segment_nbest_decompose_mode() {
+        use std::borrow::Cow;
+
+        let config = serde_json::json!({
+            "dictionary": "embedded://ipadic",
+            "mode": {
+                "decompose": {
+                    "kanji_penalty_length_threshold": 2,
+                    "kanji_penalty_length_penalty": 3000,
+                    "other_penalty_length_threshold": 7,
+                    "other_penalty_length_penalty": 1700
+                }
+            }
+        });
+        let segmenter = Segmenter::from_config(&config).unwrap();
+
+        let text = "関西国際空港限定トートバッグ";
+        let results = segmenter
+            .segment_nbest(Cow::Borrowed(text), 2, false, None)
+            .unwrap();
+
+        // Should get at least 1 result
+        assert!(!results.is_empty());
+        // All tokens should cover the full text
+        for (tokens, _cost) in &results {
+            assert!(!tokens.is_empty());
+            assert_eq!(tokens[0].byte_start, 0);
+            assert_eq!(tokens.last().unwrap().byte_end, text.len());
+        }
     }
 }

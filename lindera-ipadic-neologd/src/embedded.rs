@@ -1,4 +1,4 @@
-#[cfg(feature = "embedded-ipadic-neologd")]
+#[cfg(feature = "embed-ipadic-neologd")]
 use std::env;
 #[cfg(feature = "compress")]
 use std::ops::Deref;
@@ -18,13 +18,12 @@ macro_rules! decompress_data {
     ($name: ident, $bytes: expr, $filename: literal) => {
         #[cfg(feature = "compress")]
         static $name: once_cell::sync::Lazy<Vec<u8>> = once_cell::sync::Lazy::new(|| {
-            // First check if this is compressed data by attempting to decode as CompressedData
-            match bincode::serde::decode_from_slice::<CompressedData, _>(
-                &$bytes[..],
-                bincode::config::legacy(),
-            ) {
-                Ok((compressed_data, _)) => {
-                    // Successfully decoded as CompressedData, now decompress it
+            // First check if this is compressed data by attempting to check aligned root
+            let mut aligned = rkyv::util::AlignedVec::<16>::new();
+            aligned.extend_from_slice(&$bytes[..]);
+            match rkyv::from_bytes::<CompressedData, rkyv::rancor::Error>(&aligned) {
+                Ok(compressed_data) => {
+                    // Decompress it
                     match decompress(compressed_data) {
                         Ok(decompressed) => decompressed,
                         Err(_) => {
@@ -46,13 +45,13 @@ macro_rules! decompress_data {
 
 macro_rules! ipadicneologd_data {
     ($name: ident, $path: literal, $filename: literal) => {
-        #[cfg(feature = "embedded-ipadic-neologd")]
+        #[cfg(feature = "embed-ipadic-neologd")]
         decompress_data!(
             $name,
             include_bytes!(concat!(env!("LINDERA_WORKDIR"), $path)),
             $filename
         );
-        #[cfg(not(feature = "embedded-ipadic-neologd"))]
+        #[cfg(not(feature = "embed-ipadic-neologd"))]
         decompress_data!($name, &[], $filename);
     };
 }
@@ -60,9 +59,9 @@ macro_rules! ipadicneologd_data {
 // Metadata-specific macro (skips compression/decompression processing)
 macro_rules! ipadicneologd_metadata {
     ($name: ident, $path: literal, $filename: literal) => {
-        #[cfg(feature = "embedded-ipadic-neologd")]
+        #[cfg(feature = "embed-ipadic-neologd")]
         const $name: &'static [u8] = include_bytes!(concat!(env!("LINDERA_WORKDIR"), $path));
-        #[cfg(not(feature = "embedded-ipadic-neologd"))]
+        #[cfg(not(feature = "embed-ipadic-neologd"))]
         const $name: &'static [u8] = &[];
     };
 }

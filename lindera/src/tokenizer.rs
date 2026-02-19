@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 
 use crate::LinderaResult;
 use crate::character_filter::{BoxCharacterFilter, CharacterFilterLoader, OffsetMapping};
+use crate::dictionary::Lattice;
 use crate::error::LinderaErrorKind;
 use crate::mode::Mode;
 use crate::segmenter::Segmenter;
@@ -32,11 +33,11 @@ fn yaml_to_config(file_path: &Path) -> LinderaResult<TokenizerConfig> {
         ))
     })?;
 
-    match serde_yaml::from_slice::<serde_yaml::Value>(&buffer) {
+    match serde_yaml_ng::from_slice::<serde_yaml_ng::Value>(&buffer) {
         Ok(value) => {
             // Check if the value is a mapping.
             match value {
-                serde_yaml::Value::Mapping(_) => {
+                serde_yaml_ng::Value::Mapping(_) => {
                     Ok(serde_json::to_value(value).map_err(|err| {
                         LinderaErrorKind::Deserialize
                             .with_error(err)
@@ -318,6 +319,48 @@ impl Tokenizer {
     /// - If no character filters are applied, the original `text` is used as-is for segmentation.
     /// - Token offsets are adjusted after the tokenization process if character filters were applied to ensure the byte positions of each token are accurate relative to the original text.
     pub fn tokenize<'a>(&'a self, text: &'a str) -> LinderaResult<Vec<Token<'a>>> {
+        let mut lattice = Lattice::default();
+        self.tokenize_with_lattice(text, &mut lattice)
+    }
+
+    /// Tokenizes the input text using the tokenizer's segmenter, character filters, and token filters.
+    ///
+    /// # Arguments
+    ///
+    /// * `text` - A reference to the input text (`&str`) that will be tokenized.
+    /// * `lattice` - A mutable reference to a `Lattice` structure. This allows reusing the lattice across multiple calls to avoid memory allocation.
+    ///
+    /// # Returns
+    ///
+    /// Returns a `LinderaResult` containing a vector of `Token`s, where each `Token` represents a segment of the tokenized text.
+    ///
+    /// # Process
+    ///
+    /// 1. **Apply character filters**:
+    ///    - If any character filters are defined, they are applied to the input text before tokenization.
+    ///    - The `offsets`, `diffs`, and `text_len` are recorded for each character filter.
+    /// 2. **Segment the text**:
+    ///    - The `segmenter` divides the (potentially filtered) text into tokens.
+    /// 3. **Apply token filters**:
+    ///    - If any token filters are defined, they are applied to the segmented tokens.
+    /// 4. **Correct token offsets**:
+    ///    - If character filters were applied, the byte offsets of each token are corrected to account for changes introduced by those filters.
+    ///
+    /// # Errors
+    ///
+    /// - Returns an error if any of the character or token filters fail during processing.
+    /// - Returns an error if the segmentation process fails.
+    ///
+    /// # Details
+    ///
+    /// - `Cow<'a, str>` is used for the `normalized_text`, allowing the function to either borrow the original text or create an owned version if the text needs modification.
+    /// - If no character filters are applied, the original `text` is used as-is for segmentation.
+    /// - Token offsets are adjusted after the tokenization process if character filters were applied to ensure the byte positions of each token are accurate relative to the original text.
+    pub fn tokenize_with_lattice<'a>(
+        &'a self,
+        text: &'a str,
+        lattice: &mut Lattice,
+    ) -> LinderaResult<Vec<Token<'a>>> {
         let mut normalized_text: Cow<'a, str> = Cow::Borrowed(text);
 
         let mut offset_mappings: Vec<OffsetMapping> =
@@ -344,7 +387,10 @@ impl Tokenizer {
         let final_text_len = normalized_text.len();
 
         // Segment a text.
-        let mut tokens = self.segmenter.segment(normalized_text)?;
+        // Segment a text.
+        let mut tokens = self
+            .segmenter
+            .segment_with_lattice(normalized_text, lattice)?;
 
         // Apply token filters to the tokens if they are not empty.
         for token_filter in &self.token_filters {
@@ -366,6 +412,78 @@ impl Tokenizer {
         }
 
         Ok(tokens)
+    }
+
+    /// Tokenizes the input text and returns the top-N results.
+    ///
+    /// Each result is a `Vec<Token>` with character/token filters applied.
+    /// Results are ordered by cost (best first).
+    pub fn tokenize_nbest<'a>(
+        &'a self,
+        text: &'a str,
+        n: usize,
+        unique: bool,
+        cost_threshold: Option<i64>,
+    ) -> LinderaResult<Vec<(Vec<Token<'a>>, i64)>> {
+        let mut lattice = Lattice::default();
+        self.tokenize_nbest_with_lattice(text, &mut lattice, n, unique, cost_threshold)
+    }
+
+    /// Tokenizes the input text and returns the top-N results with costs.
+    /// Each result is a (tokens, cost) pair.
+    /// If `unique` is true, results with the same word boundaries are deduplicated.
+    /// If `cost_threshold` is Some(t), paths whose cost exceeds best_cost + t
+    /// are discarded.
+    pub fn tokenize_nbest_with_lattice<'a>(
+        &'a self,
+        text: &'a str,
+        lattice: &mut Lattice,
+        n: usize,
+        unique: bool,
+        cost_threshold: Option<i64>,
+    ) -> LinderaResult<Vec<(Vec<Token<'a>>, i64)>> {
+        let mut normalized_text: Cow<'a, str> = Cow::Borrowed(text);
+
+        let mut offset_mappings: Vec<OffsetMapping> =
+            Vec::with_capacity(self.character_filters.len());
+
+        if !self.character_filters.is_empty() {
+            let text_mut = normalized_text.to_mut();
+            for character_filter in &self.character_filters {
+                let mapping = character_filter.apply(text_mut)?;
+                if !mapping.is_empty() {
+                    offset_mappings.push(mapping);
+                }
+            }
+        }
+
+        let final_text_len = normalized_text.len();
+
+        let mut all_results = self.segmenter.segment_nbest_with_lattice(
+            normalized_text,
+            lattice,
+            n,
+            unique,
+            cost_threshold,
+        )?;
+
+        // Apply token filters and offset corrections to each result
+        for (tokens, _cost) in &mut all_results {
+            for token_filter in &self.token_filters {
+                token_filter.apply(tokens)?;
+            }
+
+            if !offset_mappings.is_empty() {
+                for token in tokens.iter_mut() {
+                    for mapping in offset_mappings.iter().rev() {
+                        token.byte_start = mapping.correct_offset(token.byte_start, final_text_len);
+                        token.byte_end = mapping.correct_offset(token.byte_end, final_text_len);
+                    }
+                }
+            }
+        }
+
+        Ok(all_results)
     }
 }
 
@@ -409,7 +527,7 @@ impl Clone for Tokenizer {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "embedded-ipadic")]
+    #[cfg(feature = "embed-ipadic")]
     #[test]
     fn test_tokenizer_config_from_slice() {
         use std::path::PathBuf;
@@ -427,7 +545,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "embedded-ipadic")]
+    #[cfg(feature = "embed-ipadic")]
     fn test_tokenizer_config_clone() {
         use std::path::PathBuf;
 
@@ -446,7 +564,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "embedded-ipadic")]
+    #[cfg(feature = "embed-ipadic")]
     fn test_tokenize_ipadic() {
         use std::borrow::Cow;
         use std::path::PathBuf;
@@ -473,7 +591,21 @@ mod tests {
                 assert_eq!(token.byte_end, 15);
                 assert_eq!(token.position, 0);
                 assert_eq!(token.position_length, 1);
-                assert_eq!(token.details, Some(vec![Cow::Borrowed("UNK")]));
+                assert!(token.word_id.is_unknown());
+                assert_eq!(
+                    token.details,
+                    Some(vec![
+                        Cow::Borrowed("名詞"),
+                        Cow::Borrowed("固有名詞"),
+                        Cow::Borrowed("組織"),
+                        Cow::Borrowed("*"),
+                        Cow::Borrowed("*"),
+                        Cow::Borrowed("*"),
+                        Cow::Borrowed("*"),
+                        Cow::Borrowed("*"),
+                        Cow::Borrowed("*"),
+                    ])
+                );
             }
             {
                 let token = tokens_iter.next().unwrap();
@@ -557,35 +689,14 @@ mod tests {
             let mut tokens = tokenizer.tokenize(text).unwrap();
             let mut tokens_iter = tokens.iter_mut();
             {
+                // "10" (unknown NUMERIC) and "ガロン" (名詞,接尾,助数詞) are merged
+                // by the japanese_compound_word filter into "10ガロン" with tag "名詞,数".
                 let token = tokens_iter.next().unwrap();
-                assert_eq!(token.surface, Cow::Borrowed("10"));
+                assert_eq!(token.surface, Cow::Owned::<str>("10ガロン".into()));
                 assert_eq!(token.byte_start, 0);
-                assert_eq!(token.byte_end, 6);
-                assert_eq!(token.position, 0);
-                assert_eq!(token.position_length, 1);
-                assert_eq!(token.details, Some(vec![Cow::Borrowed("UNK")]));
-            }
-            {
-                let token = tokens_iter.next().unwrap();
-                assert_eq!(token.surface, Cow::Borrowed("ガロン"));
-                assert_eq!(token.byte_start, 6);
                 assert_eq!(token.byte_end, 9);
-                assert_eq!(token.position, 1);
-                assert_eq!(token.position_length, 1);
-                assert_eq!(
-                    token.details,
-                    Some(vec![
-                        Cow::Borrowed("名詞"),
-                        Cow::Borrowed("接尾"),
-                        Cow::Borrowed("助数詞"),
-                        Cow::Borrowed("*"),
-                        Cow::Borrowed("*"),
-                        Cow::Borrowed("*"),
-                        Cow::Borrowed("ガロン"),
-                        Cow::Borrowed("ガロン"),
-                        Cow::Borrowed("ガロン"),
-                    ])
-                );
+                assert_eq!(token.position, 0);
+                assert_eq!(token.position_length, 2);
             }
             {
                 let token = tokens_iter.next().unwrap();
@@ -612,18 +723,12 @@ mod tests {
 
             let mut tokens_iter = tokens.iter();
             {
+                // "10" and "ガロン" are merged by the japanese_compound_word filter
                 let token = tokens_iter.next().unwrap();
                 let start = token.byte_start;
                 let end = token.byte_end;
-                assert_eq!(token.surface, Cow::Borrowed("10"));
-                assert_eq!(&text[start..end], "１０");
-            }
-            {
-                let token = tokens_iter.next().unwrap();
-                let start = token.byte_start;
-                let end = token.byte_end;
-                assert_eq!(token.surface, Cow::Borrowed("ガロン"));
-                assert_eq!(&text[start..end], "㌎");
+                assert_eq!(token.surface, Cow::Owned::<str>("10ガロン".into()));
+                assert_eq!(&text[start..end], "１０㌎");
             }
             {
                 let token = tokens_iter.next().unwrap();
@@ -780,5 +885,49 @@ mod tests {
             .join("invalid.yml");
 
         TokenizerBuilder::from_file(&config_file).unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "embed-ipadic")]
+    fn test_tokenize_nbest_1best_matches_tokenize() {
+        use crate::tokenizer::TokenizerBuilder;
+
+        let mut builder = TokenizerBuilder::new().unwrap();
+        builder.set_segmenter_dictionary("embedded://ipadic");
+
+        let tokenizer = builder.build().unwrap();
+
+        let text = "すもももももももものうち";
+        let normal_tokens = tokenizer.tokenize(text).unwrap();
+        let nbest_results = tokenizer.tokenize_nbest(text, 1, false, None).unwrap();
+
+        assert_eq!(nbest_results.len(), 1);
+        let (nbest_tokens, _cost) = &nbest_results[0];
+        assert_eq!(normal_tokens.len(), nbest_tokens.len());
+        for (normal, nbest) in normal_tokens.iter().zip(nbest_tokens.iter()) {
+            assert_eq!(normal.surface.as_ref(), nbest.surface.as_ref());
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "embed-ipadic")]
+    fn test_tokenize_nbest_multiple_results() {
+        use crate::tokenizer::TokenizerBuilder;
+
+        let mut builder = TokenizerBuilder::new().unwrap();
+        builder.set_segmenter_dictionary("embedded://ipadic");
+
+        let tokenizer = builder.build().unwrap();
+
+        let text = "すもももももももものうち";
+        let results = tokenizer.tokenize_nbest(text, 5, false, None).unwrap();
+
+        // Should return multiple results for ambiguous text
+        assert!(results.len() >= 2);
+
+        // All results should cover the full text
+        for (tokens, _cost) in &results {
+            assert!(!tokens.is_empty());
+        }
     }
 }

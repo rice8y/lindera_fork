@@ -17,7 +17,7 @@ jobs:
     runs-on: ${{ matrix.platform.runner }}
     steps:
       - name: Run checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Install toolchain
         uses: dtolnay/rust-toolchain@v1
@@ -36,15 +36,22 @@ jobs:
         platform:
           - runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          - runner: macOS-latest
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-latest
             target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
           - runner: windows-latest
             target: x86_64-pc-windows-msvc
+          - runner: windows-latest
+            target: aarch64-pc-windows-msvc
+            skip_test_run: true
         toolchain: [stable]
     runs-on: ${{ matrix.platform.runner }}
     steps:
       - name: Run checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Install toolchain
         uses: dtolnay/rust-toolchain@v1
@@ -54,11 +61,56 @@ jobs:
           components: rustfmt, clippy
 
       - name: Run test
-        run: cargo test --target "${{ matrix.platform.target }}" --all-features
+        run: cargo test --target "${{ matrix.platform.target }}" --all-features ${{ matrix.platform.skip_test_run == true && '--no-run' || '' }}
+
+  test-python:
+    name: Test Python
+    needs: [format]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run checkout
+        uses: actions/checkout@v6
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: 3.x
+
+      - name: Run Python test
+        shell: bash
+        run: |
+          make init
+          make python-test
+
+  test-wasm:
+    name: Test WASM
+    needs: [format]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run checkout
+        uses: actions/checkout@v6
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Run WASM test
+        run: make wasm-test
 
   create-release:
     name: Create Release
-    needs: [test]
+    needs: [test, test-python, test-wasm]
     runs-on: ubuntu-latest
     steps:
       - name: Create GitHub Release
@@ -73,9 +125,64 @@ jobs:
           generate_release_notes: true
           make_latest: true
 
-  release:
-    name: Build
+  build-dictionary:
+    name: Build Dictionary
     needs: [create-release]
+    strategy:
+      matrix:
+        dictionary:
+          - name: "lindera-ipadic"
+            feature: "embed-ipadic"
+          - name: "lindera-unidic"
+            feature: "embed-unidic"
+          - name: "lindera-ko-dic"
+            feature: "embed-ko-dic"
+          - name: "lindera-cc-cedict"
+            feature: "embed-cc-cedict"
+          - name: "lindera-ipadic-neologd"
+            feature: "embed-ipadic-neologd"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run checkout
+        uses: actions/checkout@v6
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Build dictionary
+        run: |
+          LINDERA_DICTIONARIES_PATH=dictionaries cargo build -p ${{ matrix.dictionary.name }} --features ${{ matrix.dictionary.feature }}
+
+      - name: Get version
+        id: get_version
+        run: |
+          VERSION=$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[] | select(.name=="${{ matrix.dictionary.name }}") | .version')
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Create artifact
+        run: |
+          cd dictionaries/${{ steps.get_version.outputs.version }}
+          zip -r ../../${{ matrix.dictionary.name }}-${{ steps.get_version.outputs.version }}.zip ${{ matrix.dictionary.name }}
+
+      - name: Upload artifact
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          files: ${{ matrix.dictionary.name }}-${{ steps.get_version.outputs.version }}.zip
+          tag_name: ${{ github.ref_name }}
+
+      - name: Upload dictionary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.dictionary.name }}
+          path: dictionaries/
+
+  build:
+    name: Build
+    needs: [create-release, build-dictionary]
     strategy:
       matrix:
         platform:
@@ -83,12 +190,24 @@ jobs:
             target: x86_64-unknown-linux-gnu
             archive: .zip
             extension: ""
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive: .zip
+            extension: ""
           - runner: macos-latest
             target: aarch64-apple-darwin
             archive: .zip
             extension: ""
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            archive: .zip
+            extension: ""
           - runner: windows-latest
             target: x86_64-pc-windows-msvc
+            archive: .zip
+            extension: .exe
+          - runner: windows-latest
+            target: aarch64-pc-windows-msvc
             archive: .zip
             extension: .exe
         toolchain: [stable]
@@ -96,50 +215,50 @@ jobs:
           - value: "default"
             package_name: "lindera"
             package_description: "Lindera (no dictionary)"
-          - value: "embedded-ipadic"
+          - value: "embed-ipadic"
             package_name: "lindera-ipadic"
             package_description: "Lindera with Japanese dictionary (IPADIC)"
-          - value: "embedded-ipadic-neologd"
-            package_name: "lindera-ipadic-nelneologd"
+          - value: "embed-ipadic-neologd"
+            package_name: "lindera-ipadic-neologd"
             package_description: "Lindera with Japanese dictionary (IPADIC-NEologd)"
-          - value: "embedded-unidic"
+          - value: "embed-unidic"
             package_name: "lindera-unidic"
             package_description: "Lindera with Japanese dictionary (UniDic)"
-          - value: "embedded-ko-dic"
+          - value: "embed-ko-dic"
             package_name: "lindera-ko-dic"
             package_description: "Lindera with Korean dictionary (ko-dic)"
-          - value: "embedded-cc-cedict"
+          - value: "embed-cc-cedict"
             package_name: "lindera-cc-cedict"
             package_description: "Lindera with Chinese dictionary (CC-CEDICT)"
-          - value: "embedded-cjk"
+          - value: "embed-cjk"
             package_name: "lindera-cjk"
             package_description: "Lindera with CJK dictionaries (IPADIC, ko-dic, CC-CEDICT)"
-          - value: "embedded-cjk2"
+          - value: "embed-cjk2"
             package_name: "lindera-cjk2"
             package_description: "Lindera with CJK dictionaries (UniDic, ko-dic, CC-CEDICT)"
-          - value: "embedded-cjk3"
+          - value: "embed-cjk3"
             package_name: "lindera-cjk3"
             package_description: "Lindera with CJK dictionaries (IPADIC NEologd, ko-dic, CC-CEDICT)"
 
     runs-on: ${{ matrix.platform.runner }}
     steps:
       - name: Run checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Cache ~/.cargo/registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cargo/registry
           key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Cache ~/.cargo/git
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cargo/git
           key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Cache target
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: target
           key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
@@ -151,22 +270,31 @@ jobs:
           target: ${{ matrix.platform.target }}
 
       - name: Add msbuild to PATH
-        if: matrix.platform.runner == 'windows-latest'
+        if: startsWith(matrix.platform.runner, 'windows')
         uses: microsoft/setup-msbuild@v2
 
+      - name: Download dictionary artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: dictionaries
+          pattern: lindera-*
+          merge-multiple: true
+
       - name: Compile
-        run: cargo build --release --features="${{ matrix.features.value }},compress" --target=${{ matrix.platform.target }} --target-dir=target/${{ matrix.features.value }}
+        run: cargo build -p lindera-cli --release --features="${{ matrix.features.value }},compress" --target=${{ matrix.platform.target }} --target-dir=target/${{ matrix.features.value }}
+        env:
+          LINDERA_DICTIONARIES_PATH: dictionaries
 
       - name: Create artifact for Linux
-        if: matrix.platform.runner == 'ubuntu-latest'
+        if: startsWith(matrix.platform.runner, 'ubuntu')
         run: zip --junk-paths ${{ matrix.features.package_name }}-${{ matrix.platform.target }}-${{ github.ref_name }}${{ matrix.platform.archive }} target/${{ matrix.features.value }}/${{ matrix.platform.target }}/release/lindera${{ matrix.platform.extension }}
 
       - name: Create artifact for Windows
-        if: matrix.platform.runner == 'windows-latest'
+        if: startsWith(matrix.platform.runner, 'windows')
         run: powershell Compress-Archive -DestinationPath ${{ matrix.features.package_name }}-${{ matrix.platform.target }}-${{ github.ref_name }}${{ matrix.platform.archive }} -Path target/${{ matrix.features.value }}/${{ matrix.platform.target }}/release/lindera${{ matrix.platform.extension }}
 
-      - name: Create artifact for OSX
-        if: matrix.platform.runner == 'macos-latest'
+      - name: Create artifact for macOS
+        if: startsWith(matrix.platform.runner, 'macos')
         run: zip --junk-paths ${{ matrix.features.package_name }}-${{ matrix.platform.target }}-${{ github.ref_name }}${{ matrix.platform.archive }} target/${{ matrix.features.value }}/${{ matrix.platform.target }}/release/lindera${{ matrix.platform.extension }}
 
       - name: Upload artifact
@@ -178,140 +306,358 @@ jobs:
           tag_name: ${{ github.ref_name }}
 
   publish-crates:
-    name: Publish crate
-    needs: [release]
+    name: Publish crates
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Publish crates
+        run: |
+          for crate in lindera-dictionary lindera-cc-cedict lindera-ipadic lindera-ipadic-neologd lindera-ko-dic lindera-unidic lindera lindera-python lindera-cli lindera-wasm; do
+            VERSION=$(cargo metadata --no-deps --format-version=1 | jq -r ".packages[] | select(.name==\"$crate\") | .version")
+            PUBLISHED_VERSIONS=$(curl -s -A "lindera-release-workflow (https://github.com/lindera/lindera)" "https://crates.io/api/v1/crates/$crate" | jq -r 'select(.versions != null) | .versions[].num')
+            if echo "${PUBLISHED_VERSIONS}" | grep -Fx "${VERSION}" >/dev/null; then
+              echo "$crate $VERSION has already published"
+            else
+              echo "Publishing $crate $VERSION..."
+              pushd $crate
+              cargo publish
+              popd
+              sleep 20
+            fi
+          done
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_TOKEN }}
+
+  build-python-wheels:
+    name: Build wheels for ${{ matrix.platform.target }}
+    needs: [create-release, build-dictionary]
     strategy:
       matrix:
         platform:
           - runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-        toolchain: [stable]
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+          - runner: windows-latest
+            target: aarch64-pc-windows-msvc
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+        features:
+          - value: "default"
+            package_name: "lindera-python"
+            package_description: "Python binding for Lindera (no embedded dictionaries)"
+          - value: "embed-cjk"
+            package_name: "lindera-python-cjk"
+            package_description: "Python binding for Lindera with CJK dictionaries (IPADIC, ko-dic, CC-CEDICT)"
+          - value: "embed-ipadic"
+            package_name: "lindera-python-ipadic"
+            package_description: "Python binding for Lindera with IPADIC dictionary"
+          - value: "embed-unidic"
+            package_name: "lindera-python-unidic"
+            package_description: "Python binding for Lindera with UniDic dictionary"
+          - value: "embed-ko-dic"
+            package_name: "lindera-python-ko-dic"
+            package_description: "Python binding for Lindera with ko-dic Korean dictionary"
+          - value: "embed-cc-cedict"
+            package_name: "lindera-python-cc-cedict"
+            package_description: "Python binding for Lindera with CC-CEDICT Chinese dictionary"
     runs-on: ${{ matrix.platform.runner }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
+      - name: Run checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: 3.x
+
+      - name: Download dictionary artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: dictionaries
+          pattern: lindera-*
+          merge-multiple: true
+
+      - name: Create package-specific pyproject.toml
+        shell: bash
+        run: |
+          python -c "
+          import sys
+          import re
+          path = 'lindera-python/pyproject.toml'
+          with open(path, 'r') as f:
+              content = f.read()
+          content = re.sub(r'^name = \"lindera-python\"', 'name = \"${{ matrix.features.package_name }}\"', content, flags=re.MULTILINE)
+          content = re.sub(r'^description = \".*\"', 'description = \"${{ matrix.features.package_description }}\"', content, flags=re.MULTILINE)
+          with open(path, 'w') as f:
+              f.write(content)
+          "
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        env:
+          NODE_OPTIONS: "--max-old-space-size=8192"
+          LINDERA_DICTIONARIES_PATH: dictionaries
+        with:
+          target: ${{ matrix.platform.target }}
+          args: --release --out dist --find-interpreter --features=${{ matrix.features.value }} --manifest-path lindera-python/Cargo.toml
+          sccache: "true"
+          manylinux: auto
+          before-script-linux: |
+            if command -v yum >/dev/null 2>&1; then
+              yum install openssl-devel devtoolset-10-libatomic-devel perl-IPC-Cmd -y
+            elif command -v apt-get >/dev/null 2>&1; then
+              apt-get update && apt-get install libssl-dev pkg-config -y
+            fi
+
+      - name: Upload artifact
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          files: dist/*
+          tag_name: ${{ github.ref_name }}
+
+      - name: Upload to workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.features.package_name }}-${{ runner.os }}-${{ matrix.platform.target }}-${{ github.ref_name }}
+          path: dist
+
+  build-python-sdist:
+    name: Build sdist for ${{ matrix.features.package_name }}
+    needs: [create-release]
+    strategy:
+      matrix:
+        features:
+          - value: "default"
+            package_name: "lindera-python"
+            package_description: "Python binding for Lindera (no embedded dictionaries)"
+          - value: "embed-cjk"
+            package_name: "lindera-python-cjk"
+            package_description: "Python binding for Lindera with CJK dictionaries (IPADIC, ko-dic, CC-CEDICT)"
+          - value: "embed-ipadic"
+            package_name: "lindera-python-ipadic"
+            package_description: "Python binding for Lindera with IPADIC dictionary"
+          - value: "embed-unidic"
+            package_name: "lindera-python-unidic"
+            package_description: "Python binding for Lindera with UniDic dictionary"
+          - value: "embed-ko-dic"
+            package_name: "lindera-python-ko-dic"
+            package_description: "Python binding for Lindera with ko-dic Korean dictionary"
+          - value: "embed-cc-cedict"
+            package_name: "lindera-python-cc-cedict"
+            package_description: "Python binding for Lindera with CC-CEDICT Chinese dictionary"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run checkout
+        uses: actions/checkout@v6
+
+      - name: Create package-specific pyproject.toml
+        shell: bash
+        run: |
+          python -c "
+          import sys
+          import re
+          path = 'lindera-python/pyproject.toml'
+          with open(path, 'r') as f:
+              content = f.read()
+          content = re.sub(r'^name = \"lindera-python\"', 'name = \"${{ matrix.features.package_name }}\"', content, flags=re.MULTILINE)
+          content = re.sub(r'^description = \".*\"', 'description = \"${{ matrix.features.package_description }}\"', content, flags=re.MULTILINE)
+          with open(path, 'w') as f:
+              f.write(content)
+          "
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist --manifest-path lindera-python/Cargo.toml
+
+      - name: Upload artifact
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          files: dist/*
+          tag_name: ${{ github.ref_name }}
+
+      - name: Upload to workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdist-${{ matrix.features.package_name }}-${{ github.ref_name }}
+          path: dist
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: [build-python-wheels, build-python-sdist]
+    runs-on: ubuntu-latest
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
+    permissions:
+      id-token: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+
+      - name: Publish to PyPI
+        uses: PyO3/maturin-action@v1
+        env:
+          MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        with:
+          command: upload
+          args: --non-interactive --skip-existing dist/*
+
+  build-wasm:
+    name: Build WASM (${{ matrix.target.name }}, ${{ matrix.features.name }})
+    needs: [publish-crates, build-dictionary]
+    runs-on: ubuntu-latest
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
+    strategy:
+      matrix:
+        target:
+          - value: "web"
+            name: "web"
+          - value: "bundler"
+            name: "bundler"
+          - value: "nodejs"
+            name: "nodejs"
+        features:
+          - value: ""
+            name: "default"
+            package_name: "lindera-wasm"
+            package_description: "Lindera WASM (no embedded dictionaries)"
+          - value: "embed-ipadic"
+            name: "ipadic"
+            package_name: "lindera-wasm-ipadic"
+            package_description: "Lindera WASM with Japanese dictionary (IPADIC)"
+          - value: "embed-unidic"
+            name: "unidic"
+            package_name: "lindera-wasm-unidic"
+            package_description: "Lindera WASM with Japanese dictionary (UniDic)"
+          - value: "embed-ko-dic"
+            name: "ko-dic"
+            package_name: "lindera-wasm-ko-dic"
+            package_description: "Lindera WASM with Korean dictionary (ko-dic)"
+          - value: "embed-cc-cedict"
+            name: "cc-cedict"
+            package_name: "lindera-wasm-cc-cedict"
+            package_description: "Lindera WASM with Chinese dictionary (CC-CEDICT)"
+          - value: "embed-cjk"
+            name: "cjk"
+            package_name: "lindera-wasm-cjk"
+            package_description: "Lindera WASM with CJK dictionaries (IPADIC, ko-dic, CC-CEDICT)"
+    steps:
+      - name: Run checkout
+        uses: actions/checkout@v6
+
+      - name: Download dictionary artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: dictionaries
+          pattern: lindera-*
+          merge-multiple: true
 
       - name: Install toolchain
         uses: dtolnay/rust-toolchain@v1
         with:
-          toolchain: ${{ matrix.toolchain }}
-          components: rustfmt, clippy
+          toolchain: stable
+          target: wasm32-unknown-unknown
 
-      - name: Publish lindera-dictionary
-        run: |
-          LINDERA_DICTIONARY_VERSION=$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[] | select(.name=="lindera-dictionary") | .version')
-          LINDERA_DICTIONARY_VERSIONS=$(curl -s -A "lindera-release-workflow (https://github.com/lindera/lindera)" https://crates.io/api/v1/crates/lindera-dictionary | jq -r '.versions[].num')
-          if echo "${LINDERA_DICTIONARY_VERSIONS}" | grep -Fx "${LINDERA_DICTIONARY_VERSION}" >/dev/null; then
-            echo "lindera-dictionary ${LINDERA_DICTIONARY_VERSION} has already published"
-          else
-            pushd lindera-dictionary
-            cargo publish
-            popd
-          fi
-          sleep 20
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_TOKEN }}
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
-      - name: Publish lindera-cc-cedict
-        run: |
-          LINDERA_CC_CEDICT_VERSION=$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[] | select(.name=="lindera-cc-cedict") | .version')
-          LINDERA_CC_CEDICT_VERSIONS=$(curl -s -A "lindera-release-workflow (https://github.com/lindera/lindera)" https://crates.io/api/v1/crates/lindera-cc-cedict | jq -r '.versions[].num')
-          if echo "${LINDERA_CC_CEDICT_VERSIONS}" | grep -Fx "${LINDERA_CC_CEDICT_VERSION}" >/dev/null; then
-            echo "lindera-cc-cedict ${LINDERA_CC_CEDICT_VERSION} has already published"
-          else
-            pushd lindera-cc-cedict
-            cargo publish
-            popd
-          fi
-          sleep 20
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_TOKEN }}
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
 
-      - name: Publish lindera-ipadic
-        run: |
-          LINDERA_IPADIC_VERSION=$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[] | select(.name=="lindera-ipadic") | .version')
-          LINDERA_IPADIC_VERSIONS=$(curl -s -A "lindera-release-workflow (https://github.com/lindera/lindera)" https://crates.io/api/v1/crates/lindera-ipadic | jq -r '.versions[].num')
-          if echo "${LINDERA_IPADIC_VERSIONS}" | grep -Fx "${LINDERA_IPADIC_VERSION}" >/dev/null; then
-            echo "lindera-ipadic ${LINDERA_IPADIC_VERSION} has already published"
-          else
-            pushd lindera-ipadic
-            cargo publish
-            popd
-          fi
-          sleep 20
+      - name: Build WASM
+        shell: bash
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_TOKEN }}
+          LINDERA_DICTIONARIES_PATH: dictionaries
+        run: |
+          cd lindera-wasm
+          wasm-pack build --release --target ${{ matrix.target.value }} ${{ matrix.features.value != '' && format('--features {0}', matrix.features.value) || '' }}
 
-      - name: Publish lindera-ipadic-neologd
+      - name: Update package.json
+        shell: bash
         run: |
-          LINDERA_IPADIC_NEOLOGD_VERSION=$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[] | select(.name=="lindera-ipadic-neologd") | .version')
-          LINDERA_IPADIC_NEOLOGD_VERSIONS=$(curl -s -A "lindera-release-workflow (https://github.com/lindera/lindera)" https://crates.io/api/v1/crates/lindera-ipadic-neologd | jq -r '.versions[].num')
-          if echo "${LINDERA_IPADIC_NEOLOGD_VERSIONS}" | grep -Fx "${LINDERA_IPADIC_NEOLOGD_VERSION}" >/dev/null; then
-            echo "lindera-ipadic-neologd ${LINDERA_IPADIC_NEOLOGD_VERSION} has already published"
-          else
-            pushd lindera-ipadic-neologd
-            cargo publish
-            popd
-          fi
-          sleep 20
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_TOKEN }}
+          cd lindera-wasm/pkg
+          jq '.name = "${{ matrix.features.package_name }}-${{ matrix.target.name }}" | .description = "${{ matrix.features.package_description }} (${{ matrix.target.name }} target)"' package.json > package.json.tmp
+          mv package.json.tmp package.json
 
-      - name: Publish lindera-ko-dic
-        run: |
-          LINDERA_KO_DIC_VERSION=$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[] | select(.name=="lindera-ko-dic") | .version')
-          LINDERA_KO_DIC_VERSIONS=$(curl -s -A "lindera-release-workflow (https://github.com/lindera/lindera)" https://crates.io/api/v1/crates/lindera-ko-dic | jq -r '.versions[].num')
-          if echo "${LINDERA_KO_DIC_VERSIONS}" | grep -Fx "${LINDERA_KO_DIC_VERSION}" >/dev/null; then
-            echo "lindera-ko-dic ${LINDERA_KO_DIC_VERSION} has already published"
-          else
-            pushd lindera-ko-dic
-            cargo publish
-            popd
-          fi
-          sleep 20
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_TOKEN }}
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-pkg-${{ matrix.features.package_name }}-${{ matrix.target.name }}
+          path: lindera-wasm/pkg
 
-      - name: Publish lindera-unidic
-        run: |
-          LINDERA_UNIDIC_VERSION=$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[] | select(.name=="lindera-unidic") | .version')
-          LINDERA_UNIDIC_VERSIONS=$(curl -s -A "lindera-release-workflow (https://github.com/lindera/lindera)" https://crates.io/api/v1/crates/lindera-unidic | jq -r '.versions[].num')
-          if echo "${LINDERA_UNIDIC_VERSIONS}" | grep -Fx "${LINDERA_UNIDIC_VERSION}" >/dev/null; then
-            echo "lindera-unidic ${LINDERA_UNIDIC_VERSION} has already published"
-          else
-            pushd lindera-unidic
-            cargo publish
-            popd
-          fi
-          sleep 20
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_TOKEN }}
+  publish-npm:
+    name: Publish to npm (${{ matrix.target.name }}, ${{ matrix.features.name }})
+    needs: [build-wasm]
+    runs-on: ubuntu-latest
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
+    strategy:
+      matrix:
+        target:
+          - value: "web"
+            name: "web"
+          - value: "bundler"
+            name: "bundler"
+          - value: "nodejs"
+            name: "nodejs"
+        features:
+          - value: ""
+            name: "default"
+            package_name: "lindera-wasm"
+          - value: "embed-ipadic"
+            name: "ipadic"
+            package_name: "lindera-wasm-ipadic"
+          - value: "embed-unidic"
+            name: "unidic"
+            package_name: "lindera-wasm-unidic"
+          - value: "embed-ko-dic"
+            name: "ko-dic"
+            package_name: "lindera-wasm-ko-dic"
+          - value: "embed-cc-cedict"
+            name: "cc-cedict"
+            package_name: "lindera-wasm-cc-cedict"
+          - value: "embed-cjk"
+            name: "cjk"
+            package_name: "lindera-wasm-cjk"
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: wasm-pkg-${{ matrix.features.package_name }}-${{ matrix.target.name }}
+          path: lindera-wasm/pkg
 
-      - name: Publish lindera
-        run: |
-          LINDERA_VERSION=$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[] | select(.name=="lindera") | .version')
-          LINDERA_VERSIONS=$(curl -s -A "lindera-release-workflow (https://github.com/lindera/lindera)" https://crates.io/api/v1/crates/lindera | jq -r '.versions[].num')
-          if echo "${LINDERA_VERSIONS}" | grep -Fx "${LINDERA_VERSION}" >/dev/null; then
-            echo "lindera ${LINDERA_VERSION} has already published"
-          else
-            pushd lindera
-            cargo publish
-            popd
-          fi
-          sleep 20
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_TOKEN }}
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
 
-      - name: Publish lindera-cli
+      - name: Publish to npm
         run: |
-          LINDERA_CLI_VERSION=$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[] | select(.name=="lindera-cli") | .version')
-          LINDERA_CLI_VERSIONS=$(curl -s -A "lindera-release-workflow (https://github.com/lindera/lindera)" https://crates.io/api/v1/crates/lindera-cli | jq -r '.versions[].num')
-          if echo "${LINDERA_CLI_VERSIONS}" | grep -Fx "${LINDERA_CLI_VERSION}" >/dev/null; then
-            echo "lindera-cli ${LINDERA_CLI_VERSION} has already published"
-          else
-            pushd lindera-cli
-            cargo publish
-            popd
-          fi
+          cd lindera-wasm/pkg
+          npm publish --access public
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NODE_AUTH_TOKEN }}

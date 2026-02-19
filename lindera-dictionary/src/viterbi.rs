@@ -1,6 +1,7 @@
 use std::io;
 
 use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
+use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use serde::{Deserialize, Serialize};
 
 use crate::dictionary::character_definition::{CategoryId, CharacterDefinition};
@@ -9,10 +10,21 @@ use crate::dictionary::prefix_dictionary::PrefixDictionary;
 use crate::dictionary::unknown_dictionary::UnknownDictionary;
 use crate::mode::Mode;
 
-const EOS_NODE: EdgeId = EdgeId(1u32);
-
 /// Type of lexicon containing the word
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, Default)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Eq,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    Default,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+
 pub enum LexType {
     /// System dictionary (base dictionary)
     #[default]
@@ -23,7 +35,19 @@ pub enum LexType {
     Unknown,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Eq,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvDeserialize,
+    RkyvSerialize,
+)]
+
 pub struct WordId {
     pub id: u32,
     pub is_system: bool,
@@ -41,7 +65,7 @@ impl WordId {
     }
 
     pub fn is_unknown(&self) -> bool {
-        self.id == u32::MAX || matches!(self.lex_type, LexType::Unknown)
+        matches!(self.lex_type, LexType::Unknown)
     }
 
     pub fn is_system(&self) -> bool {
@@ -63,7 +87,20 @@ impl Default for WordId {
     }
 }
 
-#[derive(Default, Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(
+    Default,
+    Clone,
+    Copy,
+    Debug,
+    Eq,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+
 pub struct WordEntry {
     pub word_id: WordId,
     pub word_cost: i16,
@@ -120,16 +157,13 @@ pub enum EdgeType {
     INSERTED,
 }
 
-#[derive(Eq, PartialEq, Clone, Copy, Debug)]
-pub struct EdgeId(pub u32);
-
 #[derive(Default, Clone, Debug)]
 pub struct Edge {
     pub edge_type: EdgeType,
     pub word_entry: WordEntry,
 
     pub path_cost: i32,
-    pub left_edge: Option<EdgeId>,
+    pub left_index: u16, // Index in the previous position's vector
 
     pub start_index: u32,
     pub stop_index: u32,
@@ -138,34 +172,55 @@ pub struct Edge {
 }
 
 impl Edge {
-    // TODO fix em
     pub fn num_chars(&self) -> usize {
         (self.stop_index - self.start_index) as usize / 3
     }
 }
 
+/// Records a transition from a left edge to the current edge.
+/// Used in N-Best mode to store all predecessor transitions
+/// (not just the best one as in 1-best).
+#[derive(Clone, Debug)]
+pub struct PathEntry {
+    /// Index of this edge in ends_at[stop_index]
+    pub edge_index: u16,
+    /// Byte position where the left edge ends (= this edge's start_index)
+    pub left_pos: u32,
+    /// Index of the left edge in ends_at[left_pos]
+    pub left_index: u16,
+    /// Total forward cost: left_edge.path_cost + conn_cost + penalty_cost
+    pub cost: i32,
+}
+
 #[derive(Clone, Default)]
 pub struct Lattice {
     capacity: usize,
-    edges: Vec<Edge>,
-    starts_at: Vec<Vec<EdgeId>>,
-    ends_at: Vec<Vec<EdgeId>>,
-    // Buffer reuse optimization: pre-allocated vectors for reuse
-    edge_buffer: Vec<Edge>,
-    edge_id_buffer: Vec<EdgeId>,
+    ends_at: Vec<Vec<Edge>>, // Now stores edges directly
+    char_info_buffer: Vec<CharData>,
+    categories_buffer: Vec<CategoryId>,
+    char_category_cache: Vec<Vec<CategoryId>>,
+
+    // N-Best fields (only populated when set_text_nbest is called)
+    all_paths: Vec<Vec<PathEntry>>,
+    nbest_capacity: usize,
+    /// The text length (in bytes) of the last set_text/set_text_nbest call
+    last_text_len: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CharData {
+    byte_offset: u32,
+    is_kanji: bool,
+    categories_start: u32,
+    categories_len: u16,
+    kanji_run_byte_len: u32,
 }
 
 #[inline]
-fn is_kanji(c: char) -> bool {
+pub fn is_kanji(c: char) -> bool {
     let c = c as u32;
-    // Direct comparison is faster than range.contains()
-    (19968..=40879).contains(&c)
-}
-
-#[inline]
-fn is_kanji_only(s: &str) -> bool {
-    // Early exit for empty strings
-    !s.is_empty() && s.chars().all(is_kanji)
+    // CJK Unified Ideographs (4E00-9FAF) and Extension A (3400-4DBF)
+    (0x4E00..=0x9FAF).contains(&c) || (0x3400..=0x4DBF).contains(&c)
 }
 
 impl Lattice {
@@ -181,7 +236,7 @@ impl Lattice {
         Edge {
             edge_type,
             word_entry,
-            left_edge: None,
+            left_index: u16::MAX,
             start_index: start as u32,
             stop_index: stop as u32,
             path_cost: i32::MAX,
@@ -190,122 +245,278 @@ impl Lattice {
     }
 
     pub fn clear(&mut self) {
-        for edge_vec in &mut self.starts_at {
-            edge_vec.clear();
-        }
         for edge_vec in &mut self.ends_at {
             edge_vec.clear();
         }
-        self.edges.clear();
-        // Clear buffers but preserve capacity for reuse
-        self.edge_buffer.clear();
-        self.edge_id_buffer.clear();
+        for path_vec in &mut self.all_paths {
+            path_vec.clear();
+        }
+        self.char_info_buffer.clear();
+        self.categories_buffer.clear();
     }
 
-    /// Get a reusable edge buffer with preserved capacity
-    pub fn get_edge_buffer(&mut self) -> &mut Vec<Edge> {
-        self.edge_buffer.clear();
-        &mut self.edge_buffer
+    #[inline]
+    fn is_kanji_all(&self, char_idx: usize, byte_len: usize) -> bool {
+        self.char_info_buffer[char_idx].kanji_run_byte_len >= byte_len as u32
     }
 
-    /// Get a reusable edge ID buffer with preserved capacity
-    pub fn get_edge_id_buffer(&mut self) -> &mut Vec<EdgeId> {
-        self.edge_id_buffer.clear();
-        &mut self.edge_id_buffer
+    #[inline]
+    fn get_cached_category(&self, char_idx: usize, category_ord: usize) -> CategoryId {
+        let char_data = &self.char_info_buffer[char_idx];
+        self.categories_buffer[char_data.categories_start as usize + category_ord]
     }
 
     fn set_capacity(&mut self, text_len: usize) {
         self.clear();
-        if self.capacity < text_len {
+        self.last_text_len = text_len;
+        if self.capacity <= text_len {
             self.capacity = text_len;
-            self.edges.clear();
-            self.starts_at.resize(text_len + 1, Vec::new());
             self.ends_at.resize(text_len + 1, Vec::new());
+        }
+        for vec in &mut self.ends_at {
+            vec.clear();
+        }
+    }
+
+    fn set_capacity_nbest(&mut self, text_len: usize) {
+        self.set_capacity(text_len);
+        if self.nbest_capacity <= text_len {
+            self.nbest_capacity = text_len;
+            self.all_paths.resize(text_len + 1, Vec::new());
+        }
+        for vec in &mut self.all_paths {
+            vec.clear();
         }
     }
 
     #[inline(never)]
+    // Forward Viterbi implementation:
+    // Constructs the lattice and calculates the path costs simultaneously.
+    // This improves performance by avoiding a separate lattice traversal pass.
+    #[allow(clippy::too_many_arguments)]
     pub fn set_text(
         &mut self,
         dict: &PrefixDictionary,
         user_dict: &Option<&PrefixDictionary>,
         char_definitions: &CharacterDefinition,
         unknown_dictionary: &UnknownDictionary,
+        cost_matrix: &ConnectionCostMatrix,
         text: &str,
         search_mode: &Mode,
     ) {
         let len = text.len();
         self.set_capacity(len);
 
-        let start_edge_id = self.add_edge(Edge::default());
-        let end_edge_id = self.add_edge(Edge::default());
+        // Pre-calculate character information for the text
+        self.char_info_buffer.clear();
+        self.categories_buffer.clear();
 
-        assert_eq!(EOS_NODE, end_edge_id);
-        self.ends_at[0].push(start_edge_id);
-        self.starts_at[len].push(end_edge_id);
+        if self.char_category_cache.is_empty() {
+            self.char_category_cache.resize(256, Vec::new());
+        }
 
-        // index of the last character of unknown word
+        for (byte_offset, c) in text.char_indices() {
+            let categories_start = self.categories_buffer.len() as u32;
+
+            if (c as u32) < 256 {
+                let cached = &mut self.char_category_cache[c as usize];
+                if cached.is_empty() {
+                    let cats = char_definitions.lookup_categories(c);
+                    for &category in cats {
+                        cached.push(category);
+                    }
+                }
+                for &category in cached.iter() {
+                    self.categories_buffer.push(category);
+                }
+            } else {
+                let categories = char_definitions.lookup_categories(c);
+                for &category in categories {
+                    self.categories_buffer.push(category);
+                }
+            }
+
+            let categories_len = (self.categories_buffer.len() as u32 - categories_start) as u16;
+
+            self.char_info_buffer.push(CharData {
+                byte_offset: byte_offset as u32,
+                is_kanji: is_kanji(c),
+                categories_start,
+                categories_len,
+                kanji_run_byte_len: 0,
+            });
+        }
+        // Sentinel for end of text
+        self.char_info_buffer.push(CharData {
+            byte_offset: len as u32,
+            is_kanji: false,
+            categories_start: 0,
+            categories_len: 0,
+            kanji_run_byte_len: 0,
+        });
+
+        // Pre-calculate Kanji run lengths (backwards)
+        for i in (0..self.char_info_buffer.len() - 1).rev() {
+            if self.char_info_buffer[i].is_kanji {
+                let next_byte_offset = self.char_info_buffer[i + 1].byte_offset;
+                let char_byte_len = next_byte_offset - self.char_info_buffer[i].byte_offset;
+                self.char_info_buffer[i].kanji_run_byte_len =
+                    char_byte_len + self.char_info_buffer[i + 1].kanji_run_byte_len;
+            } else {
+                self.char_info_buffer[i].kanji_run_byte_len = 0;
+            }
+        }
+
+        let start_edge = Edge {
+            path_cost: 0,
+            left_index: u16::MAX,
+            ..Default::default()
+        };
+        self.ends_at[0].push(start_edge);
+
+        // Index of the last character of unknown word
         let mut unknown_word_end: Option<usize> = None;
 
-        for start in 0..len {
+        // Pre-scan text with Aho-Corasick to report all matches
+        // Optimization: Use flat vectors instead of Vec<Vec<_>> to avoid many small allocations.
+        // Linked list structure: matches_head[start_idx] -> index in matches_store
+        let mut matches_head = vec![usize::MAX; len + 1];
+        let mut matches_store: Vec<(usize, WordEntry, usize)> = Vec::with_capacity(len * 10);
+
+        // System dictionary scan
+        for m in dict.da.find_overlapping_iter(text) {
+            let start = m.start();
+            let id = m.value();
+            let count = id & ((1u32 << 5) - 1u32);
+            let offset = id >> 5u32;
+            let offset_bytes = (offset as usize) * WordEntry::SERIALIZED_LEN;
+
+            // Bounds check for safety, though daachorse should guarantee valid ids if built correctly
+            if offset_bytes < dict.vals_data.len() {
+                let data_slice = &dict.vals_data[offset_bytes..];
+                for i in 0..count {
+                    let entry_offset = WordEntry::SERIALIZED_LEN * (i as usize);
+                    if entry_offset + WordEntry::SERIALIZED_LEN <= data_slice.len() {
+                        let entry = WordEntry::deserialize(&data_slice[entry_offset..], true);
+                        if start < matches_head.len() {
+                            let next = matches_head[start];
+                            matches_head[start] = matches_store.len();
+                            matches_store.push((m.end(), entry, next));
+                        }
+                    }
+                }
+            }
+        }
+
+        // User dictionary scan
+        if let Some(ud) = user_dict {
+            for m in ud.da.find_overlapping_iter(text) {
+                let start = m.start();
+                let id = m.value();
+                let count = id & ((1u32 << 5) - 1u32);
+                let offset = id >> 5u32;
+                let offset_bytes = (offset as usize) * WordEntry::SERIALIZED_LEN;
+
+                if offset_bytes < ud.vals_data.len() {
+                    let data_slice = &ud.vals_data[offset_bytes..];
+                    for i in 0..count {
+                        let entry_offset = WordEntry::SERIALIZED_LEN * (i as usize);
+                        if entry_offset + WordEntry::SERIALIZED_LEN <= data_slice.len() {
+                            let entry = WordEntry::deserialize(&data_slice[entry_offset..], false);
+                            if start < matches_head.len() {
+                                let next = matches_head[start];
+                                matches_head[start] = matches_store.len();
+                                matches_store.push((m.end(), entry, next));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for char_idx in 0..self.char_info_buffer.len() - 1 {
+            let start = self.char_info_buffer[char_idx].byte_offset as usize;
+
             // No arc is ending here.
             // No need to check if a valid word starts here.
             if self.ends_at[start].is_empty() {
                 continue;
             }
 
-            let suffix = &text[start..];
-
             let mut found: bool = false;
 
-            // lookup user dictionary
-            if user_dict.is_some() {
-                let dict = user_dict.as_ref().unwrap();
-                for (prefix_len, word_entry) in dict.prefix(suffix) {
+            // Use cached matches
+            if start < matches_head.len() {
+                let mut match_idx = matches_head[start];
+                while match_idx != usize::MAX {
+                    let (end, word_entry, next) = matches_store[match_idx];
+
+                    let prefix_len = end - start;
+                    let kanji_only = self.is_kanji_all(char_idx, prefix_len);
                     let edge = Self::create_edge(
                         EdgeType::KNOWN,
-                        word_entry,
+                        word_entry, // WordEntry is Copy
                         start,
-                        start + prefix_len,
-                        is_kanji_only(&suffix[..prefix_len]),
+                        end,
+                        kanji_only,
                     );
-                    self.add_edge_in_lattice(edge);
+                    self.add_edge_in_lattice(edge, cost_matrix, search_mode);
                     found = true;
-                }
-            }
 
-            // we check all word starting at start, using the double array, like we would use
-            // a prefix trie, and populate the lattice with as many edges
-            for (prefix_len, word_entry) in dict.prefix(suffix) {
-                let edge = Self::create_edge(
-                    EdgeType::KNOWN,
-                    word_entry,
-                    start,
-                    start + prefix_len,
-                    is_kanji_only(&suffix[..prefix_len]),
-                );
-                self.add_edge_in_lattice(edge);
-                found = true;
+                    match_idx = next;
+                }
             }
 
             // In the case of normal mode, it doesn't process unknown word greedily.
             if (search_mode.is_search()
                 || unknown_word_end.map(|index| index <= start).unwrap_or(true))
-                && let Some(first_char) = suffix.chars().next()
+                && char_idx < self.char_info_buffer.len() - 1
             {
-                let categories = char_definitions.lookup_categories(first_char);
-                for (category_ord, &category) in categories.iter().enumerate() {
+                let num_categories = self.char_info_buffer[char_idx].categories_len as usize;
+                for category_ord in 0..num_categories {
+                    let category = self.get_cached_category(char_idx, category_ord);
                     unknown_word_end = self.process_unknown_word(
                         char_definitions,
                         unknown_dictionary,
+                        cost_matrix,
+                        search_mode,
                         category,
                         category_ord,
                         unknown_word_end,
                         start,
-                        suffix,
+                        char_idx,
                         found,
                     );
                 }
+            }
+        }
+
+        // Connect EOS
+        if !self.ends_at[len].is_empty() {
+            let mut eos_edge = Edge {
+                start_index: len as u32,
+                stop_index: len as u32,
+                ..Default::default()
+            };
+            // Calculate cost for EOS
+            let left_edges = &self.ends_at[len];
+            let mut best_cost = i32::MAX;
+            let mut best_left = None;
+            let right_left_id = 0; // EOS default left_id
+
+            for (i, left_edge) in left_edges.iter().enumerate() {
+                let left_right_id = left_edge.word_entry.right_id();
+                let conn_cost = cost_matrix.cost(left_right_id, right_left_id);
+                let path_cost = left_edge.path_cost.saturating_add(conn_cost);
+                if path_cost < best_cost {
+                    best_cost = path_cost;
+                    best_left = Some(i as u16);
+                }
+            }
+            if let Some(left_idx) = best_left {
+                eos_edge.left_index = left_idx;
+                eos_edge.path_cost = best_cost;
+                self.ends_at[len].push(eos_edge);
             }
         }
     }
@@ -315,11 +526,13 @@ impl Lattice {
         &mut self,
         char_definitions: &CharacterDefinition,
         unknown_dictionary: &UnknownDictionary,
+        cost_matrix: &ConnectionCostMatrix,
+        search_mode: &Mode,
         category: CategoryId,
         category_ord: usize,
         unknown_word_index: Option<usize>,
         start: usize,
-        suffix: &str,
+        char_idx: usize,
         found: bool,
     ) -> Option<usize> {
         let mut unknown_word_num_chars: usize = 0;
@@ -327,116 +540,593 @@ impl Lattice {
         if category_data.invoke || !found {
             unknown_word_num_chars = 1;
             if category_data.group {
-                for c in suffix.chars().skip(1) {
-                    let categories = char_definitions.lookup_categories(c);
-                    if categories.len() > category_ord && categories[category_ord] == category {
-                        unknown_word_num_chars += 1;
-                    } else {
+                for i in 1.. {
+                    let next_idx = char_idx + i;
+                    if next_idx >= self.char_info_buffer.len() - 1 {
+                        break;
+                    }
+                    let num_categories = self.char_info_buffer[next_idx].categories_len as usize;
+                    let mut found_cat = false;
+                    if category_ord < num_categories {
+                        let cat = self.get_cached_category(next_idx, category_ord);
+                        if cat == category {
+                            unknown_word_num_chars += 1;
+                            found_cat = true;
+                        }
+                    }
+                    if !found_cat {
                         break;
                     }
                 }
             }
         }
         if unknown_word_num_chars > 0 {
-            // Optimized: Direct byte boundary calculation
-            let byte_end = suffix
-                .char_indices()
-                .nth(unknown_word_num_chars)
-                .map_or(suffix.len(), |(pos, _)| pos);
-            let unknown_word = &suffix[..byte_end];
+            let byte_end_offset =
+                self.char_info_buffer[char_idx + unknown_word_num_chars].byte_offset;
+            let byte_len = byte_end_offset as usize - start;
+
+            // Check Kanji status using pre-calculated buffer
+            let kanji_only = self.is_kanji_all(char_idx, byte_len);
+
             for &word_id in unknown_dictionary.lookup_word_ids(category) {
                 let word_entry = unknown_dictionary.word_entry(word_id);
                 let edge = Self::create_edge(
                     EdgeType::UNKNOWN,
                     word_entry,
                     start,
-                    start + unknown_word.len(),
-                    is_kanji_only(unknown_word),
+                    start + byte_len,
+                    kanji_only,
                 );
-                self.add_edge_in_lattice(edge);
+                self.add_edge_in_lattice(edge, cost_matrix, search_mode);
             }
-            return Some(start + unknown_word.len());
+            return Some(start + byte_len);
         }
         unknown_word_index
     }
 
-    fn add_edge_in_lattice(&mut self, edge: Edge) {
+    // Adds an edge to the lattice and calculates the minimum cost to reach it.
+    fn add_edge_in_lattice(
+        &mut self,
+        mut edge: Edge,
+        cost_matrix: &ConnectionCostMatrix,
+        mode: &Mode,
+    ) {
         let start_index = edge.start_index as usize;
         let stop_index = edge.stop_index as usize;
-        let edge_id = self.add_edge(edge);
-        self.starts_at[start_index].push(edge_id);
-        self.ends_at[stop_index].push(edge_id);
-    }
+        let right_left_id = edge.word_entry.left_id();
 
-    fn add_edge(&mut self, edge: Edge) -> EdgeId {
-        let edge_id = EdgeId(self.edges.len() as u32);
-        self.edges.push(edge);
-        edge_id
-    }
+        let left_edges = &self.ends_at[start_index];
+        if left_edges.is_empty() {
+            return;
+        }
 
-    pub fn edge(&self, edge_id: EdgeId) -> &Edge {
-        &self.edges[edge_id.0 as usize]
-    }
+        let mut best_cost = i32::MAX;
+        let mut best_left = None;
 
-    #[inline(never)]
-    pub fn calculate_path_costs(&mut self, cost_matrix: &ConnectionCostMatrix, mode: &Mode) {
-        let text_len = self.starts_at.len();
-        for i in 0..text_len {
-            let left_edge_ids = &self.ends_at[i];
-            let right_edge_ids = &self.starts_at[i];
-
-            for &right_edge_id in right_edge_ids {
-                // Cache right edge data to avoid repeated access
-                let right_edge = &self.edges[right_edge_id.0 as usize];
-                let right_word_entry = right_edge.word_entry;
-                let right_left_id = right_word_entry.left_id();
-
-                // Manual loop for better performance (avoids iterator overhead)
-                let mut best_cost = i32::MAX;
-                let mut best_left = None;
-
-                for &left_edge_id in left_edge_ids {
-                    let left_edge = &self.edges[left_edge_id.0 as usize];
+        match mode {
+            Mode::Normal => {
+                for (i, left_edge) in left_edges.iter().enumerate() {
                     let left_right_id = left_edge.word_entry.right_id();
+                    let conn_cost = cost_matrix.cost(left_right_id, right_left_id);
+                    let total_cost = left_edge.path_cost.saturating_add(conn_cost);
 
-                    // Calculate path cost directly
-                    let mut path_cost =
-                        left_edge.path_cost + cost_matrix.cost(left_right_id, right_left_id);
-                    path_cost += mode.penalty_cost(left_edge);
-
-                    // Track minimum cost with branch-free comparison when possible
-                    if path_cost < best_cost {
-                        best_cost = path_cost;
-                        best_left = Some(left_edge_id);
+                    if total_cost < best_cost {
+                        best_cost = total_cost;
+                        best_left = Some(i as u16);
                     }
                 }
+            }
+            Mode::Decompose(penalty) => {
+                for (i, left_edge) in left_edges.iter().enumerate() {
+                    let left_right_id = left_edge.word_entry.right_id();
+                    let conn_cost = cost_matrix.cost(left_right_id, right_left_id);
+                    let penalty_cost = penalty.penalty(left_edge);
+                    let total_cost = left_edge
+                        .path_cost
+                        .saturating_add(conn_cost)
+                        .saturating_add(penalty_cost);
 
-                // Update edge with best path if found
-                if let Some(best_left_id) = best_left {
-                    let edge = &mut self.edges[right_edge_id.0 as usize];
-                    edge.left_edge = Some(best_left_id);
-                    edge.path_cost = right_word_entry.word_cost as i32 + best_cost;
+                    if total_cost < best_cost {
+                        best_cost = total_cost;
+                        best_left = Some(i as u16);
+                    }
                 }
             }
+        }
+
+        if let Some(best_left_idx) = best_left {
+            edge.path_cost = best_cost.saturating_add(edge.word_entry.word_cost as i32);
+            edge.left_index = best_left_idx;
+            self.ends_at[stop_index].push(edge);
         }
     }
 
     pub fn tokens_offset(&self) -> Vec<(usize, WordId)> {
         let mut offsets = Vec::new();
-        let mut edge_id = EOS_NODE;
-        let _edge = self.edge(EOS_NODE);
+
+        if self.ends_at.is_empty() {
+            return offsets;
+        }
+
+        let mut last_idx = self.ends_at.len() - 1;
+        while last_idx > 0 && self.ends_at[last_idx].is_empty() {
+            last_idx -= 1;
+        }
+
+        if self.ends_at[last_idx].is_empty() {
+            return offsets;
+        }
+
+        let idx = self.ends_at[last_idx].len() - 1;
+        let mut edge = &self.ends_at[last_idx][idx];
+
+        if edge.left_index == u16::MAX {
+            return offsets;
+        }
+
         loop {
-            let edge = self.edge(edge_id);
-            if let Some(left_edge_id) = edge.left_edge {
-                offsets.push((edge.start_index as usize, edge.word_entry.word_id));
-                edge_id = left_edge_id;
-            } else {
+            if edge.left_index == u16::MAX {
                 break;
             }
+
+            offsets.push((edge.start_index as usize, edge.word_entry.word_id));
+
+            let left_idx = edge.left_index as usize;
+            let start_idx = edge.start_index as usize;
+
+            edge = &self.ends_at[start_idx][left_idx];
         }
+
         offsets.reverse();
-        offsets.pop();
+        offsets.pop(); // Remove EOS
+
         offsets
+    }
+
+    // --- N-Best support ---
+
+    /// Returns the text length (in bytes) from the last set_text/set_text_nbest call.
+    pub fn text_len(&self) -> usize {
+        self.last_text_len
+    }
+
+    /// Returns the edges at a given byte position.
+    pub fn edges_at(&self, byte_pos: usize) -> &[Edge] {
+        &self.ends_at[byte_pos]
+    }
+
+    /// Returns the N-Best path entries at a given byte position.
+    pub fn paths_at(&self, byte_pos: usize) -> &[PathEntry] {
+        if byte_pos < self.all_paths.len() {
+            &self.all_paths[byte_pos]
+        } else {
+            &[]
+        }
+    }
+
+    /// Adds an edge to the lattice, recording ALL predecessor transitions for N-Best.
+    fn add_edge_in_lattice_nbest(
+        &mut self,
+        mut edge: Edge,
+        cost_matrix: &ConnectionCostMatrix,
+        mode: &Mode,
+    ) {
+        let start_index = edge.start_index as usize;
+        let stop_index = edge.stop_index as usize;
+        let right_left_id = edge.word_entry.left_id();
+
+        let left_edges = &self.ends_at[start_index];
+        if left_edges.is_empty() {
+            return;
+        }
+
+        let mut best_cost = i32::MAX;
+        let mut best_left = None;
+
+        // The edge_index of the new edge being added
+        let new_edge_index = self.ends_at[stop_index].len() as u16;
+
+        match mode {
+            Mode::Normal => {
+                for (i, left_edge) in left_edges.iter().enumerate() {
+                    let left_right_id = left_edge.word_entry.right_id();
+                    let conn_cost = cost_matrix.cost(left_right_id, right_left_id);
+                    let total_cost = left_edge.path_cost.saturating_add(conn_cost);
+
+                    // Record ALL transitions for N-Best
+                    self.all_paths[stop_index].push(PathEntry {
+                        edge_index: new_edge_index,
+                        left_pos: start_index as u32,
+                        left_index: i as u16,
+                        cost: total_cost,
+                    });
+
+                    if total_cost < best_cost {
+                        best_cost = total_cost;
+                        best_left = Some(i as u16);
+                    }
+                }
+            }
+            Mode::Decompose(penalty) => {
+                for (i, left_edge) in left_edges.iter().enumerate() {
+                    let left_right_id = left_edge.word_entry.right_id();
+                    let conn_cost = cost_matrix.cost(left_right_id, right_left_id);
+                    let penalty_cost = penalty.penalty(left_edge);
+                    let total_cost = left_edge
+                        .path_cost
+                        .saturating_add(conn_cost)
+                        .saturating_add(penalty_cost);
+
+                    // Record ALL transitions for N-Best
+                    self.all_paths[stop_index].push(PathEntry {
+                        edge_index: new_edge_index,
+                        left_pos: start_index as u32,
+                        left_index: i as u16,
+                        cost: total_cost,
+                    });
+
+                    if total_cost < best_cost {
+                        best_cost = total_cost;
+                        best_left = Some(i as u16);
+                    }
+                }
+            }
+        }
+
+        if let Some(best_left_idx) = best_left {
+            edge.path_cost = best_cost.saturating_add(edge.word_entry.word_cost as i32);
+            edge.left_index = best_left_idx;
+            self.ends_at[stop_index].push(edge);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn process_unknown_word_nbest(
+        &mut self,
+        char_definitions: &CharacterDefinition,
+        unknown_dictionary: &UnknownDictionary,
+        cost_matrix: &ConnectionCostMatrix,
+        search_mode: &Mode,
+        category: CategoryId,
+        category_ord: usize,
+        unknown_word_index: Option<usize>,
+        start: usize,
+        char_idx: usize,
+        found: bool,
+    ) -> Option<usize> {
+        let mut unknown_word_num_chars: usize = 0;
+        let category_data = char_definitions.lookup_definition(category);
+        if category_data.invoke || !found {
+            unknown_word_num_chars = 1;
+            if category_data.group {
+                for i in 1.. {
+                    let next_idx = char_idx + i;
+                    if next_idx >= self.char_info_buffer.len() - 1 {
+                        break;
+                    }
+                    let num_categories = self.char_info_buffer[next_idx].categories_len as usize;
+                    let mut found_cat = false;
+                    if category_ord < num_categories {
+                        let cat = self.get_cached_category(next_idx, category_ord);
+                        if cat == category {
+                            unknown_word_num_chars += 1;
+                            found_cat = true;
+                        }
+                    }
+                    if !found_cat {
+                        break;
+                    }
+                }
+            }
+        }
+        if unknown_word_num_chars > 0 {
+            let byte_end_offset =
+                self.char_info_buffer[char_idx + unknown_word_num_chars].byte_offset;
+            let byte_len = byte_end_offset as usize - start;
+
+            let kanji_only = self.is_kanji_all(char_idx, byte_len);
+
+            for &word_id in unknown_dictionary.lookup_word_ids(category) {
+                let word_entry = unknown_dictionary.word_entry(word_id);
+                let edge = Self::create_edge(
+                    EdgeType::UNKNOWN,
+                    word_entry,
+                    start,
+                    start + byte_len,
+                    kanji_only,
+                );
+                self.add_edge_in_lattice_nbest(edge, cost_matrix, search_mode);
+            }
+            return Some(start + byte_len);
+        }
+        unknown_word_index
+    }
+
+    /// Forward Viterbi implementation for N-Best mode.
+    /// Same as set_text() but records ALL predecessor transitions in all_paths.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_text_nbest(
+        &mut self,
+        dict: &PrefixDictionary,
+        user_dict: &Option<&PrefixDictionary>,
+        char_definitions: &CharacterDefinition,
+        unknown_dictionary: &UnknownDictionary,
+        cost_matrix: &ConnectionCostMatrix,
+        text: &str,
+        search_mode: &Mode,
+    ) {
+        let len = text.len();
+        self.set_capacity_nbest(len);
+
+        // Pre-calculate character information for the text
+        self.char_info_buffer.clear();
+        self.categories_buffer.clear();
+
+        if self.char_category_cache.is_empty() {
+            self.char_category_cache.resize(256, Vec::new());
+        }
+
+        for (byte_offset, c) in text.char_indices() {
+            let categories_start = self.categories_buffer.len() as u32;
+
+            if (c as u32) < 256 {
+                let cached = &mut self.char_category_cache[c as usize];
+                if cached.is_empty() {
+                    let cats = char_definitions.lookup_categories(c);
+                    for &category in cats {
+                        cached.push(category);
+                    }
+                }
+                for &category in cached.iter() {
+                    self.categories_buffer.push(category);
+                }
+            } else {
+                let categories = char_definitions.lookup_categories(c);
+                for &category in categories {
+                    self.categories_buffer.push(category);
+                }
+            }
+
+            let categories_len = (self.categories_buffer.len() as u32 - categories_start) as u16;
+
+            self.char_info_buffer.push(CharData {
+                byte_offset: byte_offset as u32,
+                is_kanji: is_kanji(c),
+                categories_start,
+                categories_len,
+                kanji_run_byte_len: 0,
+            });
+        }
+        // Sentinel for end of text
+        self.char_info_buffer.push(CharData {
+            byte_offset: len as u32,
+            is_kanji: false,
+            categories_start: 0,
+            categories_len: 0,
+            kanji_run_byte_len: 0,
+        });
+
+        // Pre-calculate Kanji run lengths (backwards)
+        for i in (0..self.char_info_buffer.len() - 1).rev() {
+            if self.char_info_buffer[i].is_kanji {
+                let next_byte_offset = self.char_info_buffer[i + 1].byte_offset;
+                let char_byte_len = next_byte_offset - self.char_info_buffer[i].byte_offset;
+                self.char_info_buffer[i].kanji_run_byte_len =
+                    char_byte_len + self.char_info_buffer[i + 1].kanji_run_byte_len;
+            } else {
+                self.char_info_buffer[i].kanji_run_byte_len = 0;
+            }
+        }
+
+        let start_edge = Edge {
+            path_cost: 0,
+            left_index: u16::MAX,
+            ..Default::default()
+        };
+        self.ends_at[0].push(start_edge);
+
+        let mut unknown_word_end: Option<usize> = None;
+
+        // Pre-scan text with Aho-Corasick
+        let mut matches_head = vec![usize::MAX; len + 1];
+        let mut matches_store: Vec<(usize, WordEntry, usize)> = Vec::with_capacity(len * 10);
+
+        // System dictionary scan
+        for m in dict.da.find_overlapping_iter(text) {
+            let start = m.start();
+            let id = m.value();
+            let count = id & ((1u32 << 5) - 1u32);
+            let offset = id >> 5u32;
+            let offset_bytes = (offset as usize) * WordEntry::SERIALIZED_LEN;
+
+            if offset_bytes < dict.vals_data.len() {
+                let data_slice = &dict.vals_data[offset_bytes..];
+                for i in 0..count {
+                    let entry_offset = WordEntry::SERIALIZED_LEN * (i as usize);
+                    if entry_offset + WordEntry::SERIALIZED_LEN <= data_slice.len() {
+                        let entry = WordEntry::deserialize(&data_slice[entry_offset..], true);
+                        if start < matches_head.len() {
+                            let next = matches_head[start];
+                            matches_head[start] = matches_store.len();
+                            matches_store.push((m.end(), entry, next));
+                        }
+                    }
+                }
+            }
+        }
+
+        // User dictionary scan
+        if let Some(ud) = user_dict {
+            for m in ud.da.find_overlapping_iter(text) {
+                let start = m.start();
+                let id = m.value();
+                let count = id & ((1u32 << 5) - 1u32);
+                let offset = id >> 5u32;
+                let offset_bytes = (offset as usize) * WordEntry::SERIALIZED_LEN;
+
+                if offset_bytes < ud.vals_data.len() {
+                    let data_slice = &ud.vals_data[offset_bytes..];
+                    for i in 0..count {
+                        let entry_offset = WordEntry::SERIALIZED_LEN * (i as usize);
+                        if entry_offset + WordEntry::SERIALIZED_LEN <= data_slice.len() {
+                            let entry = WordEntry::deserialize(&data_slice[entry_offset..], false);
+                            if start < matches_head.len() {
+                                let next = matches_head[start];
+                                matches_head[start] = matches_store.len();
+                                matches_store.push((m.end(), entry, next));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for char_idx in 0..self.char_info_buffer.len() - 1 {
+            let start = self.char_info_buffer[char_idx].byte_offset as usize;
+
+            if self.ends_at[start].is_empty() {
+                continue;
+            }
+
+            let mut found: bool = false;
+
+            if start < matches_head.len() {
+                let mut match_idx = matches_head[start];
+                while match_idx != usize::MAX {
+                    let (end, word_entry, next) = matches_store[match_idx];
+
+                    let prefix_len = end - start;
+                    let kanji_only = self.is_kanji_all(char_idx, prefix_len);
+                    let edge =
+                        Self::create_edge(EdgeType::KNOWN, word_entry, start, end, kanji_only);
+                    self.add_edge_in_lattice_nbest(edge, cost_matrix, search_mode);
+                    found = true;
+
+                    match_idx = next;
+                }
+            }
+
+            if (search_mode.is_search()
+                || unknown_word_end.map(|index| index <= start).unwrap_or(true))
+                && char_idx < self.char_info_buffer.len() - 1
+            {
+                let num_categories = self.char_info_buffer[char_idx].categories_len as usize;
+                for category_ord in 0..num_categories {
+                    let category = self.get_cached_category(char_idx, category_ord);
+                    unknown_word_end = self.process_unknown_word_nbest(
+                        char_definitions,
+                        unknown_dictionary,
+                        cost_matrix,
+                        search_mode,
+                        category,
+                        category_ord,
+                        unknown_word_end,
+                        start,
+                        char_idx,
+                        found,
+                    );
+                }
+            }
+        }
+
+        // Connect EOS with all-path recording
+        if !self.ends_at[len].is_empty() {
+            let eos_edge_index = self.ends_at[len].len() as u16;
+            let mut eos_edge = Edge {
+                start_index: len as u32,
+                stop_index: len as u32,
+                ..Default::default()
+            };
+            let left_edges = &self.ends_at[len];
+            let mut best_cost = i32::MAX;
+            let mut best_left = None;
+            let right_left_id = 0; // EOS default left_id
+
+            for (i, left_edge) in left_edges.iter().enumerate() {
+                let left_right_id = left_edge.word_entry.right_id();
+                let conn_cost = cost_matrix.cost(left_right_id, right_left_id);
+                let path_cost = left_edge.path_cost.saturating_add(conn_cost);
+
+                // Record all transitions to EOS
+                self.all_paths[len].push(PathEntry {
+                    edge_index: eos_edge_index,
+                    left_pos: len as u32,
+                    left_index: i as u16,
+                    cost: path_cost,
+                });
+
+                if path_cost < best_cost {
+                    best_cost = path_cost;
+                    best_left = Some(i as u16);
+                }
+            }
+            if let Some(left_idx) = best_left {
+                eos_edge.left_index = left_idx;
+                eos_edge.path_cost = best_cost;
+                self.ends_at[len].push(eos_edge);
+            }
+        }
+    }
+
+    /// Returns the top-N paths through the lattice.
+    /// Each result is a (path, cost) pair where path is a Vec of (byte_start, WordId) pairs.
+    /// The first result (index 0) is the 1-best path.
+    /// If `unique` is true, paths with the same segmentation (same byte_start sequence)
+    /// are deduplicated, keeping only the first (lowest cost) variant.
+    /// If `cost_threshold` is Some(t), paths whose cost exceeds best_cost + t are discarded.
+    /// Requires set_text_nbest() to have been called first.
+    pub fn nbest_tokens_offset(
+        &self,
+        n: usize,
+        unique: bool,
+        cost_threshold: Option<i64>,
+    ) -> Vec<(Vec<(usize, WordId)>, i64)> {
+        use std::collections::HashSet;
+
+        use crate::nbest::NBestGenerator;
+        let mut generator = NBestGenerator::new(self);
+        let mut results = Vec::with_capacity(n);
+        let mut best_cost: Option<i64> = None;
+
+        if unique {
+            let mut seen: HashSet<Vec<usize>> = HashSet::new();
+            while results.len() < n {
+                match generator.next() {
+                    Some((path, cost)) => {
+                        // Record best cost from first result
+                        let bc = *best_cost.get_or_insert(cost);
+                        // Skip if cost exceeds threshold
+                        if let Some(threshold) = cost_threshold {
+                            if cost > bc + threshold {
+                                break;
+                            }
+                        }
+                        let key: Vec<usize> = path.iter().map(|(start, _)| *start).collect();
+                        if seen.insert(key) {
+                            results.push((path, cost));
+                        }
+                    }
+                    None => break,
+                }
+            }
+        } else {
+            while results.len() < n {
+                match generator.next() {
+                    Some((path, cost)) => {
+                        let bc = *best_cost.get_or_insert(cost);
+                        if let Some(threshold) = cost_threshold {
+                            if cost > bc + threshold {
+                                break;
+                            }
+                        }
+                        results.push((path, cost));
+                    }
+                    None => break,
+                }
+            }
+        }
+        results
     }
 }
 

@@ -14,7 +14,7 @@ Put the following in Cargo.toml:
 
 ```toml
 [dependencies]
-lindera = { version = "1.1.0", features = ["embedded-ipadic"] }
+lindera = { version = "1.1.0", features = ["embed-ipadic"] }
 ```
 
 This example covers the basic usage of Lindera.
@@ -52,7 +52,7 @@ fn main() -> LinderaResult<()> {
 The above example can be run as follows:
 
 ```shell
-% cargo run --features=embedded-ipadic --example=tokenize
+% cargo run --features=embed-ipadic --example=tokenize
 ```
 
 You can see the result as follows:
@@ -76,7 +76,7 @@ Put the following in Cargo.toml:
 
 ```toml
 [dependencies]
-lindera = { version = "1.1.0", features = ["embedded-ipadic"] }
+lindera = { version = "1.1.0", features = ["embed-ipadic"] }
 ```
 
 For example:
@@ -143,7 +143,7 @@ fn main() -> LinderaResult<()> {
 The above example can be by `cargo run --example`:
 
 ```shell
-% cargo run --features=embedded-ipadic --example=tokenize_with_user_dict
+% cargo run --features=embed-ipadic --example=tokenize_with_user_dict
 text:   東京スカイツリーの最寄り駅はとうきょうスカイツリー駅です
 token:  東京スカイツリー        カスタム名詞,*,*,*,*,*,東京スカイツリー,トウキョウスカイツリー,*
 token:  の      助詞,連体化,*,*,*,*,の,ノ,ノ
@@ -159,7 +159,7 @@ Put the following in Cargo.toml:
 
 ```toml
 [dependencies]
-lindera = { version = "1.1.0", features = ["embedded-ipadic"] }
+lindera = { version = "1.1.0", features = ["embed-ipadic"] }
 ```
 
 This example covers the basic usage of Lindera Analysis Framework.
@@ -275,7 +275,7 @@ fn main() -> LinderaResult<()> {
 The above example can be run as follows:
 
 ```shell
-% cargo run --features=embedded-ipadic --example=tokenize_with_filters
+% cargo run --features=embed-ipadic --example=tokenize_with_filters
 ```
 
 You can see the result as follows:
@@ -406,9 +406,9 @@ fn main() -> LinderaResult<()> {
 
 ## Environment Variables
 
-### LINDERA_CACHE
+### LINDERA_DICTIONARIES_PATH
 
-The `LINDERA_CACHE` environment variable specifies a directory for caching dictionary source files. This enables:
+The `LINDERA_DICTIONARIES_PATH` environment variable specifies a directory for caching dictionary source files. This enables:
 
 - **Offline builds**: Once downloaded, dictionary source files are preserved for future builds
 - **Faster builds**: Subsequent builds skip downloading if valid cached files exist
@@ -417,11 +417,11 @@ The `LINDERA_CACHE` environment variable specifies a directory for caching dicti
 Usage:
 
 ```shell
-export LINDERA_CACHE=/path/to/cache
+export LINDERA_DICTIONARIES_PATH=/path/to/cache
 cargo build --features=ipadic
 ```
 
-When set, dictionary source files are stored in `$LINDERA_CACHE/<version>/` where `<version>` is the lindera-dictionary crate version. The cache validates files using MD5 checksums - invalid files are automatically re-downloaded.
+When set, dictionary source files are stored in `$LINDERA_DICTIONARIES_PATH/<version>/` where `<version>` is the lindera-dictionary crate version. The cache validates files using MD5 checksums - invalid files are automatically re-downloaded.
 
 ### LINDERA_CONFIG_PATH
 

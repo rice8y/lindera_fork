@@ -11,6 +11,7 @@ use std::str;
 
 use byteorder::{ByteOrder, LittleEndian};
 use once_cell::sync::Lazy;
+use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use serde::{Deserialize, Serialize};
 
 use crate::LinderaResult;
@@ -38,6 +39,14 @@ pub struct Dictionary {
 }
 
 impl Dictionary {
+    /// Retrieve the detail fields (POS, etc.) for an unknown word entry.
+    pub fn unknown_word_details(&self, word_id: usize) -> Vec<&str> {
+        match self.unknown_dictionary.word_details(word_id as u32) {
+            Some(details) => details,
+            None => UNK.to_vec(),
+        }
+    }
+
     pub fn word_details(&self, word_id: usize) -> Vec<&str> {
         if 4 * word_id >= self.prefix_dictionary.words_idx_data.len() {
             return vec![];
@@ -141,16 +150,19 @@ impl Dictionary {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize)]
+
 pub struct UserDictionary {
     pub dict: PrefixDictionary,
 }
 
 impl UserDictionary {
     pub fn load(user_dict_data: &[u8]) -> LinderaResult<UserDictionary> {
-        bincode::serde::decode_from_slice(user_dict_data, bincode::config::legacy())
-            .map(|(result, _len)| result)
-            .map_err(|err| LinderaErrorKind::Deserialize.with_error(anyhow::anyhow!(err)))
+        let mut aligned = rkyv::util::AlignedVec::<16>::new();
+        aligned.extend_from_slice(user_dict_data);
+        rkyv::from_bytes::<UserDictionary, rkyv::rancor::Error>(&aligned).map_err(|err| {
+            LinderaErrorKind::Deserialize.with_error(anyhow::anyhow!(err.to_string()))
+        })
     }
 
     pub fn word_details(&self, word_id: usize) -> Vec<&str> {

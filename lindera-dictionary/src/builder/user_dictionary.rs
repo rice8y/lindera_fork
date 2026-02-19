@@ -7,9 +7,9 @@ use std::path::Path;
 
 use byteorder::{LittleEndian, WriteBytesExt};
 use csv::StringRecord;
+use daachorse::DoubleArrayAhoCorasickBuilder;
 use derive_builder::Builder;
 use log::debug;
-use yada::builder::DoubleArrayBuilder;
 
 use crate::LinderaResult;
 use crate::dictionary::UserDictionary;
@@ -220,14 +220,14 @@ impl UserDictionaryBuilder {
             keyset.push((key.as_bytes(), val));
             id += len;
         }
-        let da_bytes = DoubleArrayBuilder::build(&keyset).ok_or_else(|| {
-            LinderaErrorKind::Build
-                .with_error(anyhow::anyhow!("DoubleArray build error."))
-                .add_context(format!(
-                    "Failed to build DoubleArray with {} keys for user dictionary",
-                    keyset.len()
-                ))
-        })?;
+        let da_bytes = DoubleArrayAhoCorasickBuilder::new()
+            .build_with_values(keyset)
+            .map_err(|err| {
+                LinderaErrorKind::Build
+                    .with_error(anyhow::anyhow!(err))
+                    .add_context("Failed to build DoubleArray for user dictionary")
+            })?
+            .serialize();
 
         // building values
         let mut vals_data = Vec::<u8>::new();
@@ -274,14 +274,20 @@ pub fn build_user_dictionary(user_dict: UserDictionary, output_file: &Path) -> L
                 "Failed to create user dictionary output file: {output_file:?}"
             ))
     })?);
-    bincode::serde::encode_into_std_write(&user_dict, &mut wtr, bincode::config::legacy())
-        .map_err(|err| {
-            LinderaErrorKind::Serialize
-                .with_error(anyhow::anyhow!(err))
-                .add_context(format!(
-                    "Failed to serialize user dictionary to file: {output_file:?}"
-                ))
-        })?;
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&user_dict).map_err(|err| {
+        LinderaErrorKind::Serialize
+            .with_error(anyhow::anyhow!(err))
+            .add_context(format!(
+                "Failed to serialize user dictionary to file: {output_file:?}"
+            ))
+    })?;
+    wtr.write_all(&bytes).map_err(|err| {
+        LinderaErrorKind::Io
+            .with_error(anyhow::anyhow!(err))
+            .add_context(format!(
+                "Failed to write user dictionary to file: {output_file:?}"
+            ))
+    })?;
     wtr.flush().map_err(|err| {
         LinderaErrorKind::Io
             .with_error(anyhow::anyhow!(err))
